@@ -4,7 +4,7 @@
 #
 # User commands:
 #   te-vpn start|stop|restart     start/stop the VPN (+ monit supervision)
-#   te-vpn status                 process, TUN, devices, routing, server, sub
+#   te-vpn status                 process, transparent proxy, devices, routing, server, sub
 #   te-vpn add <mac|ip> [note]    route a device through the VPN
 #   te-vpn remove <mac|ip>        stop routing a device through the VPN
 #   te-vpn devices                list devices added with `te-vpn add`
@@ -26,6 +26,10 @@ CONFIG=$DIR/config.yaml
 CONF=$DIR/te-vpn.conf
 [ -f "$CONF" ] && . "$CONF"
 MARK=${MARK:-0x6d69}
+REDIR_PORT=${REDIR_PORT:-7892}
+TPROXY_PORT=${TPROXY_PORT:-7895}
+TPROXY_MARK=${TPROXY_MARK:-0x1}
+BLOCK_QUIC=${BLOCK_QUIC:-1}
 TABLE=${TABLE:-1000}
 PRIO=${PRIO:-99}
 TUN=${TUN:-mihomo0}
@@ -36,8 +40,11 @@ BIN=/opt/sbin/mihomo
 API=http://127.0.0.1:9090
 PIDFILE=/opt/var/run/mihomo.pid
 LOG=/opt/var/log/mihomo.log
+POLICY_MARK_CACHE=/opt/var/run/te-vpn.policy_mark
 GROUP=PROXY
 CHAIN=MIHOMO
+TP_CHAIN=MIHOMO_TP
+REDIR_CHAIN=MIHOMO_REDIR
 
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -53,29 +60,40 @@ lan_ip() { ip -4 -o addr show br0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
 # tiny JSON value extractor: json_get '<key>' < json
 json_get() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1; }
 
-# --- routing: mark selected devices and steer both marks into the TUN --------
+# --- routing: mark selected devices and deliver them to mihomo ---------------
 #
 # Two sources of "this device goes through the VPN", active simultaneously:
 #   1. $DEVICES list — our iptables chain marks the listed MACs/IPs with $MARK.
 #   2. Keenetic access policy $POLICY_NAME — the firmware itself connmarks
 #      member devices (assigned in the web UI); we look that mark up by name.
-# ip rules at priority $PRIO (before Keenetic's own rules at 100) send both
-# marks to table $TABLE whose default route is the mihomo TUN.
+# A nat REDIRECT chain sends selected TCP packets to mihomo's redir-port. UDP is
+# handled by TPROXY; QUIC/HTTP3 can be dropped so clients fall back to TCP.
 #
-# Fallback: if mihomo dies, the TUN and its route vanish, table $TABLE turns
-# empty, the rules stop matching and traffic falls through to the normal
-# routing — devices keep internet, just without the VPN.
+# Fallback: controlled stops call route_del and remove our transparent proxy
+# chains; crash recovery is handled by monit, which restarts mihomo quickly.
 
 # fwmark of the Keenetic policy (matched by CLI name or UI description),
 # e.g. "0xffffaab". Empty if unset / not found / no ndmc on this box.
 policy_mark() {
     [ -n "$POLICY_NAME" ] || return 1
-    command -v ndmc >/dev/null 2>&1 || return 1
-    # a policy line reads "policy, name = X, description = Y:" — the name is
-    # followed by "," when a description exists and by ":" when it doesn't
-    ndmc -c 'show ip policy' 2>/dev/null | awk -v n="$POLICY_NAME" '
+    if command -v ndmc >/dev/null 2>&1; then
+        # a policy line reads "policy, name = X, description = Y:" — the name is
+        # followed by "," when a description exists and by ":" when it doesn't
+        pm=$(ndmc -c 'show ip policy' 2>/dev/null | awk -v n="$POLICY_NAME" '
         /policy, name = / { cur = (index($0, "name = " n ",") > 0 || index($0, "name = " n ":") > 0 || index($0, "description = " n ":") > 0) }
-        cur && $1 == "mark:" { print "0x" $2; exit }'
+        cur && $1 == "mark:" { print "0x" $2; exit }')
+        if [ -n "$pm" ]; then
+            mkdir -p "${POLICY_MARK_CACHE%/*}" 2>/dev/null
+            echo "$pm" > "$POLICY_MARK_CACHE" 2>/dev/null
+            echo "$pm"
+            return 0
+        fi
+    fi
+    # NDM can call netfilter.d while its policy output is temporarily
+    # unavailable; keep using the last known mark instead of dropping policy
+    # devices from transparent proxy rules.
+    [ -s "$POLICY_MARK_CACHE" ] && { cat "$POLICY_MARK_CACHE"; return 0; }
+    return 1
 }
 
 # (re)build the device-marking chain from $DEVICES; idempotent
@@ -97,9 +115,9 @@ sync_marks() {
             n=$((n + 1))
         done < "$DEVICES"
     fi
-    # append = after Keenetic's connmark restore, so our mark wins
-    iptables -t mangle -C PREROUTING -j "$CHAIN" 2>/dev/null || \
-        iptables -t mangle -A PREROUTING -j "$CHAIN"
+    # append = after Keenetic's policy marking, before our delivery chains
+    while iptables -t mangle -D PREROUTING -j "$CHAIN" 2>/dev/null; do :; done
+    iptables -t mangle -A PREROUTING -j "$CHAIN"
     logger -t te-vpn "route: synced $n device mark(s) -> $MARK"
 }
 
@@ -109,41 +127,123 @@ del_marks() {
     iptables -t mangle -X "$CHAIN" 2>/dev/null
 }
 
-# drop every rule pointing at our table (covers stale marks after a
-# policy rename/removal)
+add_tproxy_rules() {
+    mod=$1
+    mark=$2
+    [ "$BLOCK_QUIC" = "1" ] && \
+        iptables -t mangle -A "$TP_CHAIN" -p udp --dport 443 -m "$mod" --mark "$mark" -j DROP
+    iptables -t mangle -A "$TP_CHAIN" -p udp -m "$mod" --mark "$mark" \
+        -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$TPROXY_MARK/$TPROXY_MARK"
+}
+
+add_redirect_rules() {
+    mod=$1
+    mark=$2
+    iptables -t nat -A "$REDIR_CHAIN" -p tcp -m "$mod" --mark "$mark" \
+        -j REDIRECT --to-ports "$REDIR_PORT"
+}
+
+sync_tproxy() {
+    iptables -t mangle -N "$TP_CHAIN" 2>/dev/null
+    iptables -t mangle -F "$TP_CHAIN"
+
+    # Packets for local services and LAN/multicast destinations must stay on
+    # the router/LAN. Selected UDP below is delivered to mihomo via TPROXY.
+    iptables -t mangle -A "$TP_CHAIN" -d 0.0.0.0/8 -j RETURN
+    iptables -t mangle -A "$TP_CHAIN" -d 10.0.0.0/8 -j RETURN
+    iptables -t mangle -A "$TP_CHAIN" -d 127.0.0.0/8 -j RETURN
+    iptables -t mangle -A "$TP_CHAIN" -d 169.254.0.0/16 -j RETURN
+    iptables -t mangle -A "$TP_CHAIN" -d 172.16.0.0/12 -j RETURN
+    iptables -t mangle -A "$TP_CHAIN" -d 192.168.0.0/16 -j RETURN
+    iptables -t mangle -A "$TP_CHAIN" -d 224.0.0.0/4 -j RETURN
+    iptables -t mangle -A "$TP_CHAIN" -d 240.0.0.0/4 -j RETURN
+
+    add_tproxy_rules mark "$MARK"
+    pm=$(policy_mark)
+    if [ -n "$pm" ]; then
+        add_tproxy_rules mark "$pm"
+        logger -t te-vpn "route: TPROXY policy '$POLICY_NAME' mark $pm -> :$TPROXY_PORT"
+    elif [ -n "$POLICY_NAME" ]; then
+        logger -t te-vpn "route: policy '$POLICY_NAME' not found — devices.list only"
+    fi
+
+    while iptables -t mangle -D PREROUTING -j "$TP_CHAIN" 2>/dev/null; do :; done
+    iptables -t mangle -A PREROUTING -j "$TP_CHAIN"
+}
+
+sync_redirect() {
+    iptables -t nat -N "$REDIR_CHAIN" 2>/dev/null
+    iptables -t nat -F "$REDIR_CHAIN"
+
+    iptables -t nat -A "$REDIR_CHAIN" -d 0.0.0.0/8 -j RETURN
+    iptables -t nat -A "$REDIR_CHAIN" -d 10.0.0.0/8 -j RETURN
+    iptables -t nat -A "$REDIR_CHAIN" -d 127.0.0.0/8 -j RETURN
+    iptables -t nat -A "$REDIR_CHAIN" -d 169.254.0.0/16 -j RETURN
+    iptables -t nat -A "$REDIR_CHAIN" -d 172.16.0.0/12 -j RETURN
+    iptables -t nat -A "$REDIR_CHAIN" -d 192.168.0.0/16 -j RETURN
+    iptables -t nat -A "$REDIR_CHAIN" -d 224.0.0.0/4 -j RETURN
+    iptables -t nat -A "$REDIR_CHAIN" -d 240.0.0.0/4 -j RETURN
+
+    add_redirect_rules mark "$MARK"
+    pm=$(policy_mark)
+    [ -n "$pm" ] && add_redirect_rules mark "$pm"
+
+    while iptables -t nat -D PREROUTING -j "$REDIR_CHAIN" 2>/dev/null; do :; done
+    iptables -t nat -A PREROUTING -j "$REDIR_CHAIN"
+}
+
+del_tproxy() {
+    while iptables -t mangle -D PREROUTING -j "$TP_CHAIN" 2>/dev/null; do :; done
+    iptables -t mangle -F "$TP_CHAIN" 2>/dev/null
+    iptables -t mangle -X "$TP_CHAIN" 2>/dev/null
+}
+
+del_redirect() {
+    while iptables -t nat -D PREROUTING -j "$REDIR_CHAIN" 2>/dev/null; do :; done
+    iptables -t nat -F "$REDIR_CHAIN" 2>/dev/null
+    iptables -t nat -X "$REDIR_CHAIN" 2>/dev/null
+}
+
+# Allow forwarding LAN <-> tunnel. This is only a stale TUN-era cleanup helper;
+# the transparent proxy path does not forward through $TUN.
+del_forward() {
+    while iptables -D FORWARD -o "$TUN" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "$TUN" -j ACCEPT 2>/dev/null; do :; done
+}
+
+# re-assert everything the firmware may have wiped on a firewall rebuild.
+sync_all() {
+    sync_marks
+    sync_tproxy
+    sync_redirect
+}
+
+# drop every rule pointing at our table (covers stale marks after a policy
+# rename/removal) plus the old POC table-100 TPROXY rule if present.
 del_rules() {
     ip rule show | sed -n "s/.*fwmark \([^ ]*\) lookup $TABLE[[:space:]]*$/\1/p" \
         | while read -r m; do
               while ip rule del fwmark "$m" table "$TABLE" 2>/dev/null; do :; done
           done
+    while ip rule del fwmark "$TPROXY_MARK/$TPROXY_MARK" table 100 2>/dev/null; do :; done
 }
 
 route_add() {
-    sync_marks
-    i=0
-    while ! ip link show "$TUN" >/dev/null 2>&1; do
-        i=$((i + 1))
-        [ "$i" -ge 10 ] && { logger -t te-vpn "route: $TUN not up after 10s"; return 1; }
-        sleep 1
-    done
-    ip route replace default dev "$TUN" table "$TABLE" 2>/dev/null
+    sync_all
     del_rules
-    ip rule add fwmark "$MARK" table "$TABLE" priority "$PRIO" 2>/dev/null
-    marks="$MARK"
-    pm=$(policy_mark)
-    if [ -n "$pm" ]; then
-        ip rule add fwmark "$pm" table "$TABLE" priority "$PRIO" 2>/dev/null
-        marks="$marks + $pm ($POLICY_NAME)"
-    elif [ -n "$POLICY_NAME" ]; then
-        logger -t te-vpn "route: policy '$POLICY_NAME' not found — devices.list only"
-    fi
-    logger -t te-vpn "route: fwmark $marks -> table $TABLE -> $TUN"
+    ip route replace local default dev lo table "$TABLE" 2>/dev/null
+    ip route flush table 100 2>/dev/null
+    ip rule add fwmark "$TPROXY_MARK/$TPROXY_MARK" table "$TABLE" priority "$PRIO" 2>/dev/null
+    logger -t te-vpn "route: TCP REDIRECT :$REDIR_PORT + UDP TPROXY :$TPROXY_PORT"
 }
 
 route_del() {
     del_rules
     ip route flush table "$TABLE" 2>/dev/null
     del_marks
+    del_tproxy
+    del_redirect
+    del_forward
     logger -t te-vpn "route: removed"
 }
 
@@ -156,9 +256,15 @@ route_status() {
         echo "keenetic policy \"$POLICY_NAME\": ${pm:-not found}"
     fi
     echo "rules:"
-    ip rule show | grep -iE "$MARK|lookup $TABLE" || echo "  (none)"
+    ip rule show | grep -iE "$TPROXY_MARK|$MARK|lookup $TABLE" || echo "  (none)"
     echo "table $TABLE:"
     ip route show table "$TABLE" 2>/dev/null | sed 's/^/  /' || echo "  (empty)"
+    echo "tproxy (mangle/$TP_CHAIN, port $TPROXY_PORT, mark $TPROXY_MARK):"
+    iptables -t mangle -S "$TP_CHAIN" 2>/dev/null | grep -v '^-N' | sed 's/^/  /' \
+        || echo "  (chain missing)"
+    echo "tcp redirect (nat/$REDIR_CHAIN, port $REDIR_PORT):"
+    iptables -t nat -S "$REDIR_CHAIN" 2>/dev/null | grep -v '^-N' | sed 's/^/  /' \
+        || echo "  (chain missing)"
 }
 
 # --- daemon -------------------------------------------------------------------
@@ -200,8 +306,13 @@ cmd_status() {
     if is_running; then echo "  RUNNING (PID $(cat "$PIDFILE" 2>/dev/null))"; else echo "  STOPPED"; fi
     has_monit && echo "  monit: supervised"
 
-    echo "=== TUN ==="
-    ip -o link show "$TUN" 2>/dev/null | sed 's/^/  /' || echo "  $TUN: down"
+    echo "=== transparent proxy ==="
+    tun_line=$(ip -o link show "$TUN" 2>/dev/null)
+    if [ -n "$tun_line" ]; then
+        echo "$tun_line" | sed 's/^/  /'
+    else
+        echo "  $TUN: down (not used in transparent proxy mode)"
+    fi
 
     echo "=== devices -> VPN ==="
     if [ -f "$DEVICES" ] && grep -q '^[^#[:space:]]' "$DEVICES" 2>/dev/null; then
@@ -258,7 +369,7 @@ case "${1:-}" in
         case "${2:-}" in
             add)        route_add ;;
             del)        route_del ;;
-            sync)       sync_marks ;;
+            sync)       sync_all ;;
             status)     route_status ;;
             policymark) policy_mark ;;
             *) echo "usage: te-vpn route {add|del|sync|status|policymark}"; exit 1 ;;
@@ -296,8 +407,17 @@ case "${1:-}" in
         ;;
     sub)
         [ -z "${2:-}" ] && { echo "usage: te-vpn sub \"<subscription-url>\""; exit 1; }
-        # only touch the line carrying the #sub marker (not the health-check url)
-        sed -i "s#^\([[:space:]]*url:\).*#sub.*#\1 \"$2\"  #sub#" "$CONFIG"
+        # Rewrite only the line carrying the #sub marker. awk via ENVIRON so any
+        # URL (containing #, &, /, ? ...) is treated literally — no sed
+        # delimiter clashes, no regex interpretation of the URL.
+        URL="$2" awk '
+            /url:/ && /#sub[[:space:]]*$/ {
+                match($0, /^[[:space:]]*/)
+                print substr($0, 1, RLENGTH) "url: \"" ENVIRON["URL"] "\"  #sub"
+                next
+            }
+            { print }
+        ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
         echo "subscription url updated"
         "$0" reload
         ;;
@@ -306,6 +426,8 @@ case "${1:-}" in
              -H 'Content-Type: application/json' \
              -d "{\"path\":\"$CONFIG\"}" >/dev/null 2>&1
         curl -fsS -X PUT "$API/providers/proxies/airport" >/dev/null 2>&1
+        # a config reload may flush our hooks -> restore them immediately
+        is_running && route_add
         echo "config reloaded + subscription refreshed"
         ;;
     servers|list)

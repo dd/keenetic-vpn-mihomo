@@ -6,8 +6,9 @@
 #   1. installs missing dependencies via opkg (curl, iptables, monit)
 #   2. detects the router CPU arch and downloads the matching mihomo binary
 #   3. downloads the metacubexd web UI
-#   4. deploys the router/ tree to /opt (preserving an existing config.yaml,
-#      te-vpn.conf and devices.list — repo versions land as *.new)
+#   4. deploys the router/ tree to /opt (preserving local te-vpn.conf and
+#      devices.list; config.yaml keeps subscription/local settings but is
+#      upgraded in-place for the current transparent-proxy mode)
 #   5. creates the Keenetic access policy "$POLICY_NAME" so devices can be
 #      routed into the VPN straight from the web UI
 #   6. validates the config and starts mihomo under monit supervision
@@ -93,8 +94,10 @@ window.__METACUBEXD_CONFIG__ = {
 EOF"
 
 echo ">> Deploying router/ tree -> /opt"
-# Live files that may carry local state (subscription, device list, marks)
-# are never overwritten: the repo version goes to <file>.new instead.
+# Live files that may carry local state are not blindly overwritten: the repo
+# version goes to <file>.new instead. config.yaml is upgraded in-place below so
+# old installs get the current transparent-proxy technical settings while
+# keeping their subscription URL.
 KEEP=""
 for f in etc/mihomo/config.yaml etc/mihomo/te-vpn.conf etc/mihomo/devices.list; do
     if $R "test -f /opt/$f"; then
@@ -105,6 +108,57 @@ for f in etc/mihomo/config.yaml etc/mihomo/te-vpn.conf etc/mihomo/devices.list; 
 done
 # shellcheck disable=SC2086
 tar -C "$TREE" $KEEP -cf - . | $R 'tar -C /opt -xf -'
+
+echo ">> Ensuring live mihomo config matches transparent-proxy mode"
+$R 'cat > /tmp/te-vpn-upgrade-config.awk <<'"'"'AWK'"'"'
+BEGIN { skip=0; inserted=0 }
+/^sniffer:/ { skip=1; next }
+skip && /^[^[:space:]]/ { skip=0 }
+skip { next }
+/^mixed-port:/ {
+    print
+    print "redir-port: 7892          # TCP transparent proxy entrypoint used by te-vpn"
+    print "tproxy-port: 7895         # UDP transparent proxy entrypoint used by te-vpn"
+    next
+}
+/^redir-port:/ || /^tproxy-port:/ { next }
+/store-fake-ip:/ { print "  store-fake-ip: false"; next }
+!inserted && /^tun:/ {
+    print "# --- Sniffing ---------------------------------------------------------------"
+    print "# Transparent proxy gives mihomo the original IP. Sniffing recovers HTTP Host /"
+    print "# TLS SNI so rule matching, connection display and app edge-cases work like"
+    print "# normal proxying."
+    print "sniffer:"
+    print "  enable: true"
+    print "  force-dns-mapping: true"
+    print "  parse-pure-ip: true"
+    print "  override-destination: true"
+    print "  sniff:"
+    print "    HTTP:"
+    print "      ports:"
+    print "        - 80"
+    print "        - 8080-8880"
+    print "      override-destination: true"
+    print "    TLS:"
+    print "      ports:"
+    print "        - 443"
+    print "        - 8443"
+    print "    QUIC:"
+    print "      ports:"
+    print "        - 443"
+    print "        - 8443"
+    print ""
+    inserted=1
+}
+in_tun && /^  enable:/ { print "  enable: false"; next }
+/^tun:/ { in_tun=1; print; next }
+in_tun && /^[^[:space:]]/ { in_tun=0 }
+/enhanced-mode:/ { print "  enhanced-mode: redir-host"; next }
+{ print }
+AWK
+    cp /opt/etc/mihomo/config.yaml /opt/etc/mihomo/config.yaml.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null || true
+    awk -f /tmp/te-vpn-upgrade-config.awk /opt/etc/mihomo/config.yaml > /opt/etc/mihomo/config.yaml.tmp
+    mv /opt/etc/mihomo/config.yaml.tmp /opt/etc/mihomo/config.yaml'
 
 echo ">> Setting permissions"
 $R 'chmod +x /opt/bin/te-vpn /opt/etc/init.d/S06mihomo \

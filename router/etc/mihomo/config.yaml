@@ -3,6 +3,8 @@
 # /opt/bin/te-vpn (settings: /opt/etc/mihomo/te-vpn.conf).
 
 mixed-port: 7890          # plain HTTP/SOCKS proxy too (optional, handy for tests)
+redir-port: 7892          # TCP transparent proxy entrypoint used by te-vpn
+tproxy-port: 7895         # UDP transparent proxy entrypoint used by te-vpn
 allow-lan: true
 bind-address: "*"
 mode: rule
@@ -17,11 +19,37 @@ secret: ""                # set a password here to protect the UI/API if exposed
 
 profile:
   store-selected: true    # remember the manually selected server across restarts (#5)
-  store-fake-ip: true
+  store-fake-ip: false
 
-# --- TUN (the device our policy-routed traffic enters) -----------------------
-tun:
+# --- Sniffing ---------------------------------------------------------------
+# Transparent proxy gives mihomo the original IP. Sniffing recovers HTTP Host /
+# TLS SNI so rule matching, connection display and app edge-cases work like
+# normal proxying.
+sniffer:
   enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  override-destination: true
+  sniff:
+    HTTP:
+      ports:
+        - 80
+        - 8080-8880
+      override-destination: true
+    TLS:
+      ports:
+        - 443
+        - 8443
+    QUIC:
+      ports:
+        - 443
+        - 8443
+
+# --- Transparent proxy -------------------------------------------------------
+# te-vpn redirects selected TCP to redir-port and selected UDP to tproxy-port.
+# The old TUN block is kept disabled for compatibility with older installs.
+tun:
+  enable: false
   device: mihomo0
   stack: gvisor           # gvisor = most portable on the 4.9 kernel
   auto-route: false       # we manage routing ourselves (te-vpn route), no full hijack
@@ -32,12 +60,12 @@ tun:
   mtu: 1500
   strict-route: false
 
-# --- DNS (used for traffic that enters the TUN) ------------------------------
+# --- DNS ---------------------------------------------------------------------
 dns:
   enable: true
   listen: 0.0.0.0:1053    # not 53 — avoid clashing with the router's dnsmasq
   ipv6: false
-  enhanced-mode: fake-ip
+  enhanced-mode: redir-host
   fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
     - "*.lan"

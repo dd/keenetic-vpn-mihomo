@@ -29,7 +29,8 @@ $R 'PN=$(sed -n "s/^POLICY_NAME=//p" /opt/etc/mihomo/te-vpn.conf 2>/dev/null | h
 echo ">> Removing files"
 $R 'rm -f /opt/sbin/mihomo /opt/bin/te-vpn \
           /opt/etc/init.d/S06mihomo /opt/etc/monit.d/mihomo.conf \
-          /opt/etc/ndm/wan.d/10-mihomo.sh /opt/etc/ndm/netfilter.d/50-mihomo.sh
+          /opt/etc/ndm/wan.d/10-mihomo.sh /opt/etc/ndm/netfilter.d/50-mihomo.sh \
+          /opt/var/run/te-vpn.policy_mark
     rm -rf /opt/etc/mihomo/ui /opt/share/mihomo'
 $R 'command -v monit >/dev/null && monit reload 2>/dev/null; true'
 
