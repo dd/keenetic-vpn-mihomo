@@ -1,0 +1,49 @@
+#!/bin/sh
+# /opt/bin/mihomo-route — policy routing that feeds EJX-policy traffic into mihomo.
+#
+# The Keenetic "EJX" access policy marks its member devices' connections with
+# connmark 0xffffaaa (restored to the packet nfmark in mangle PREROUTING).
+# We add a rule (priority 99, BEFORE Keenetic's own rule 100) that sends those
+# packets to table 1000, whose default route points at the mihomo TUN.
+#
+# Fallback (requirement #6): if mihomo is down the TUN (and its route) vanish,
+# table 1000 becomes empty, our rule finds no route and the kernel falls through
+# to Keenetic's rule 100 -> the policy's normal table -> WAN. Devices keep
+# internet, just without the VPN.
+
+MARK=0xffffaaa
+TABLE=1000
+PRIO=99
+TUN=mihomo0
+
+add() {
+    i=0
+    while ! ip link show "$TUN" >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -ge 10 ] && { logger -t mihomo "route: $TUN not up after 10s"; return 1; }
+        sleep 1
+    done
+    ip route replace default dev "$TUN" table "$TABLE" 2>/dev/null
+    # de-dupe then add our rule
+    while ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
+    ip rule add fwmark "$MARK" table "$TABLE" priority "$PRIO" 2>/dev/null
+    logger -t mihomo "route: fwmark $MARK -> table $TABLE -> $TUN"
+}
+
+del() {
+    while ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
+    ip route flush table "$TABLE" 2>/dev/null
+    logger -t mihomo "route: removed"
+}
+
+case "${1:-}" in
+    add) add ;;
+    del) del ;;
+    status)
+        echo "rules:"
+        ip rule show | grep -iE "$MARK|lookup $TABLE" || echo "  (none)"
+        echo "table $TABLE:"
+        ip route show table "$TABLE" 2>/dev/null | sed 's/^/  /' || echo "  (empty)"
+        ;;
+    *) echo "usage: $0 {add|del|status}"; exit 1 ;;
+esac
