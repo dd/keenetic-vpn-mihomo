@@ -1,7 +1,8 @@
 # /opt/etc/mihomo/config.yaml
-# Mihomo VPN for Keenetic NC-2312 (replaces proprietary spider).
-# Traffic of devices in the Keenetic "EJX" access policy (connmark 0xffffaaa)
-# is routed into the mihomo TUN by policy routing (see /opt/bin/mihomo-route).
+# Self-contained mihomo VPN for Keenetic (Entware).
+# Traffic of devices listed in /opt/etc/mihomo/devices.list is marked by our
+# own iptables chain and routed into the mihomo TUN by policy routing
+# (see /opt/bin/mihomo-route and /opt/etc/mihomo/vpn.conf).
 
 mixed-port: 7890          # plain HTTP/SOCKS proxy too (optional, handy for tests)
 allow-lan: true
@@ -56,8 +57,8 @@ dns:
     - 8.8.8.8
 
 # --- Subscription ------------------------------------------------------------
-# Change the URL with:  vpn sub "https://your-new-subscription-url"
-# The trailing  #sub  marker is how the `vpn` tool finds this line — keep it.
+# Change the URL with:  te-vpn sub "https://your-new-subscription-url"
+# The trailing  #sub  marker is how the `te-vpn` tool finds this line — keep it.
 proxy-providers:
   airport:
     type: http

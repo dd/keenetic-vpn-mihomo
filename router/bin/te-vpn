@@ -1,0 +1,169 @@
+#!/bin/sh
+# /opt/bin/te-vpn — control the mihomo VPN on Keenetic.
+#
+#   te-vpn start|stop|restart        start/stop the VPN (+ monit supervision)
+#   te-vpn status                    process, TUN, routing, current server, sub, UI
+#   te-vpn add <mac|ip> [comment]    route a device through the VPN
+#   te-vpn remove <mac|ip>           stop routing a device through the VPN
+#   te-vpn devices                   list VPN devices
+#   te-vpn sub "<url>"               set a new subscription URL and reload
+#   te-vpn reload                    reload config + refresh subscription (no restart)
+#   te-vpn servers                   list available servers
+#   te-vpn select "<name>"           switch to a specific server (manual)
+#   te-vpn auto                      switch group to AUTO (first healthy server)
+#   te-vpn log [N]                   tail the mihomo log
+
+DIR=/opt/etc/mihomo
+CONFIG=$DIR/config.yaml
+API=http://127.0.0.1:9090
+INIT=/opt/etc/init.d/S06mihomo
+PIDFILE=/opt/var/run/mihomo.pid
+LOG=/opt/var/log/mihomo.log
+GROUP=PROXY
+
+VPNCONF=$DIR/vpn.conf
+[ -f "$VPNCONF" ] && . "$VPNCONF"
+DEVICES=${DEVICES:-$DIR/devices.list}
+
+has_monit() { command -v monit >/dev/null 2>&1 && monit summary 2>/dev/null | grep -qi mihomo; }
+is_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }
+lan_ip() { ip -4 -o addr show br0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1; }
+
+# tiny JSON value extractor: json_get '<key>' < json
+json_get() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1; }
+
+cmd_status() {
+    echo "=== mihomo ==="
+    if is_running; then echo "  RUNNING (PID $(cat "$PIDFILE"))"; else echo "  STOPPED"; fi
+    has_monit && echo "  monit: supervised"
+
+    echo "=== TUN ==="
+    ip -o link show mihomo0 2>/dev/null | sed 's/^/  /' || echo "  mihomo0: down"
+
+    echo "=== devices -> VPN ==="
+    if [ -f "$DEVICES" ] && grep -q '^[^#[:space:]]' "$DEVICES" 2>/dev/null; then
+        grep '^[^#[:space:]]' "$DEVICES" | sed 's/^/  /'
+    else
+        echo "  (none in devices.list — add with: te-vpn add <mac|ip>)"
+    fi
+    if [ -n "${POLICY_NAME:-}" ]; then
+        pm=$(/opt/bin/mihomo-route policymark 2>/dev/null)
+        if [ -n "$pm" ]; then
+            echo "  + Keenetic policy \"$POLICY_NAME\" (mark $pm) — assign devices in the web UI"
+        else
+            echo "  ! Keenetic policy \"$POLICY_NAME\" not found in the firmware"
+        fi
+    fi
+
+    echo "=== routing ==="
+    /opt/bin/mihomo-route status 2>/dev/null | sed 's/^/  /'
+
+    echo "=== current server ==="
+    now=$(curl -fsS "$API/proxies/$GROUP" 2>/dev/null | json_get now)
+    echo "  $GROUP -> ${now:-<api unavailable>}"
+
+    echo "=== subscription ==="
+    url=$(sed -n 's/.*url:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*#sub.*/\1/p' "$CONFIG")
+    echo "  url: ${url:-<not set>}"
+    prov=$(curl -fsS "$API/providers/proxies/airport" 2>/dev/null)
+    if [ -n "$prov" ]; then
+        n=$(echo "$prov" | grep -o '"name":' | wc -l)
+        echo "  servers loaded: $((n>0?n-1:0))"
+    fi
+
+    echo "=== web UI ==="
+    echo "  http://$(lan_ip || echo '<router-ip>'):9090/ui"
+}
+
+case "${1:-}" in
+    start)
+        "$INIT" start
+        has_monit && monit monitor mihomo 2>/dev/null
+        ;;
+    stop)
+        has_monit && monit unmonitor mihomo 2>/dev/null
+        "$INIT" stop
+        ;;
+    restart)
+        has_monit && monit unmonitor mihomo 2>/dev/null
+        "$INIT" restart
+        has_monit && monit monitor mihomo 2>/dev/null
+        ;;
+    status)
+        cmd_status
+        ;;
+    add)
+        [ -z "${2:-}" ] && { echo "usage: te-vpn add <mac|ip> [comment]"; exit 1; }
+        entry=$2; shift 2
+        if grep -qiwF "$entry" "$DEVICES" 2>/dev/null; then
+            echo "already listed: $entry"
+        else
+            printf '%s%s\n' "$entry" "${*:+  # $*}" >> "$DEVICES"
+            echo "added: $entry"
+        fi
+        /opt/bin/mihomo-route sync
+        ;;
+    remove|del)
+        [ -z "${2:-}" ] && { echo "usage: te-vpn remove <mac|ip>"; exit 1; }
+        if grep -qiwF "$2" "$DEVICES" 2>/dev/null; then
+            # drop the matching non-comment line (case-insensitive for MACs)
+            awk -v e="$2" 'BEGIN{e=tolower(e)}
+                 /^[#[:space:]]/ {print; next}
+                 tolower($1) != e {print}' "$DEVICES" > "$DEVICES.tmp" \
+                && mv "$DEVICES.tmp" "$DEVICES"
+            echo "removed: $2"
+            /opt/bin/mihomo-route sync
+        else
+            echo "not found: $2 (see: te-vpn devices)"
+        fi
+        ;;
+    devices)
+        grep '^[^#[:space:]]' "$DEVICES" 2>/dev/null || echo "(none)"
+        ;;
+    sub)
+        [ -z "${2:-}" ] && { echo "usage: te-vpn sub \"<subscription-url>\""; exit 1; }
+        # Only touch the line carrying the #sub marker (not the health-check url).
+        sed -i "s#^\([[:space:]]*url:\).*#sub.*#\1 \"$2\"  #sub#" "$CONFIG"
+        echo "subscription url updated"
+        "$0" reload
+        ;;
+    reload)
+        curl -fsS -X PUT "$API/configs?force=true" \
+             -H 'Content-Type: application/json' \
+             -d "{\"path\":\"$CONFIG\"}" >/dev/null 2>&1
+        curl -fsS -X PUT "$API/providers/proxies/airport" >/dev/null 2>&1
+        echo "config reloaded + subscription refreshed"
+        ;;
+    servers|list)
+        if command -v jq >/dev/null 2>&1; then
+            curl -fsS "$API/proxies/$GROUP" | jq -r '.all[]'
+        else
+            curl -fsS "$API/proxies/$GROUP" \
+                | grep -o '"all":\[[^]]*\]' \
+                | sed 's/.*\[//; s/\]//; s/","/\n/g; s/"//g'
+        fi
+        ;;
+    select|use)
+        [ -z "${2:-}" ] && { echo "usage: te-vpn select \"<server-name>\""; exit 1; }
+        if curl -fsS -X PUT "$API/proxies/$GROUP" \
+            -H 'Content-Type: application/json' \
+            -d "{\"name\":\"$2\"}" >/dev/null 2>&1; then
+            echo "selected: $2"
+        else
+            echo "failed — check the exact name with: te-vpn servers"
+        fi
+        ;;
+    auto)
+        curl -fsS -X PUT "$API/proxies/$GROUP" \
+            -H 'Content-Type: application/json' -d '{"name":"AUTO"}' >/dev/null 2>&1 \
+            && echo "switched to AUTO"
+        ;;
+    log)
+        tail -n "${2:-40}" "$LOG"
+        ;;
+    *)
+        echo "te-vpn start|stop|restart|status"
+        echo "    add <mac|ip> [comment] | remove <mac|ip> | devices"
+        echo "    sub \"<url>\" | reload | servers | select \"<name>\" | auto | log [N]"
+        ;;
+esac

@@ -1,22 +1,93 @@
 #!/bin/sh
-# /opt/bin/mihomo-route — policy routing that feeds EJX-policy traffic into mihomo.
+# /opt/bin/mihomo-route — self-contained marking + policy routing for mihomo.
 #
-# The Keenetic "EJX" access policy marks its member devices' connections with
-# connmark 0xffffaaa (restored to the packet nfmark in mangle PREROUTING).
-# We add a rule (priority 99, BEFORE Keenetic's own rule 100) that sends those
-# packets to table 1000, whose default route points at the mihomo TUN.
+# Two sources of "this device goes through the VPN", both active at once:
+#   1. $DEVICES list — our own iptables chain (mangle/MIHOMO) marks packets
+#      of the listed MACs/IPs with fwmark $MARK. Works on a stock router.
+#   2. Keenetic access policy $POLICY_NAME — the firmware itself connmarks
+#      member devices (assigned in the web UI); we look that mark up by
+#      policy name via ndmc and route it too.
 #
-# Fallback (requirement #6): if mihomo is down the TUN (and its route) vanish,
-# table 1000 becomes empty, our rule finds no route and the kernel falls through
-# to Keenetic's rule 100 -> the policy's normal table -> WAN. Devices keep
-# internet, just without the VPN.
+# Routing: ip rules (priority $PRIO, BEFORE Keenetic's own rules at 100)
+# send packets with either mark to table $TABLE, whose default route points
+# at the mihomo TUN.
+#
+# Fallback: if mihomo is down the TUN (and its route) vanish, table $TABLE
+# becomes empty, our rules find no route and the kernel falls through to the
+# normal routing -> WAN. Devices keep internet, just without the VPN.
+#
+# Usage: mihomo-route {add|del|sync|status|policymark}
+#   add        — sync device marks + install rules/route (waits for the TUN)
+#   del        — remove marks, rules and route
+#   sync       — re-apply device marks only (used by the netfilter.d hook)
+#   status     — show current marks/rules/routes
+#   policymark — print the fwmark of the $POLICY_NAME Keenetic policy
 
-MARK=0xffffaaa
-TABLE=1000
-PRIO=99
-TUN=mihomo0
+CONF=/opt/etc/mihomo/vpn.conf
+[ -f "$CONF" ] && . "$CONF"
+MARK=${MARK:-0x6d69}
+TABLE=${TABLE:-1000}
+PRIO=${PRIO:-99}
+TUN=${TUN:-mihomo0}
+DEVICES=${DEVICES:-/opt/etc/mihomo/devices.list}
+POLICY_NAME=${POLICY_NAME:-}
+CHAIN=MIHOMO
+
+# fwmark of the Keenetic access policy $POLICY_NAME (matched by CLI name or
+# by UI description), e.g. "0xffffaab". Empty if unset/not found/no ndmc.
+policy_mark() {
+    [ -n "$POLICY_NAME" ] || return 1
+    command -v ndmc >/dev/null 2>&1 || return 1
+    ndmc -c 'show ip policy' 2>/dev/null | awk -v n="$POLICY_NAME" '
+        /policy, name = / { cur = (index($0, "name = " n ",") > 0 || index($0, "description = " n ":") > 0) }
+        cur && $1 == "mark:" { print "0x" $2; exit }'
+}
+
+# (Re)build the marking chain from the devices file. Idempotent.
+sync_marks() {
+    iptables -t mangle -N "$CHAIN" 2>/dev/null
+    iptables -t mangle -F "$CHAIN"
+    n=0
+    if [ -f "$DEVICES" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            entry=${line%%#*}                      # strip comments
+            entry=$(echo "$entry" | awk '{print $1}')  # first field only
+            [ -z "$entry" ] && continue
+            case "$entry" in
+                *:*) iptables -t mangle -A "$CHAIN" -m mac --mac-source "$entry" \
+                         -j MARK --set-mark "$MARK" 2>/dev/null || \
+                         logger -t mihomo "route: bad device entry '$entry'" ;;
+                *)   iptables -t mangle -A "$CHAIN" -s "$entry" \
+                         -j MARK --set-mark "$MARK" 2>/dev/null || \
+                         logger -t mihomo "route: bad device entry '$entry'" ;;
+            esac
+            n=$((n + 1))
+        done < "$DEVICES"
+    fi
+    # hook the chain into PREROUTING (append = after Keenetic's connmark
+    # restore, so our mark wins for listed devices)
+    iptables -t mangle -C PREROUTING -j "$CHAIN" 2>/dev/null || \
+        iptables -t mangle -A PREROUTING -j "$CHAIN"
+    logger -t mihomo "route: synced $n device mark(s) -> $MARK"
+}
+
+del_marks() {
+    while iptables -t mangle -D PREROUTING -j "$CHAIN" 2>/dev/null; do :; done
+    iptables -t mangle -F "$CHAIN" 2>/dev/null
+    iptables -t mangle -X "$CHAIN" 2>/dev/null
+}
+
+# Drop every rule pointing at our table (covers stale marks after a
+# policy rename/removal).
+del_rules() {
+    ip rule show | sed -n "s/.*fwmark \([^ ]*\) lookup $TABLE[[:space:]]*$/\1/p" \
+        | while read -r m; do
+              while ip rule del fwmark "$m" table "$TABLE" 2>/dev/null; do :; done
+          done
+}
 
 add() {
+    sync_marks
     i=0
     while ! ip link show "$TUN" >/dev/null 2>&1; do
         i=$((i + 1))
@@ -24,26 +95,43 @@ add() {
         sleep 1
     done
     ip route replace default dev "$TUN" table "$TABLE" 2>/dev/null
-    # de-dupe then add our rule
-    while ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
+    del_rules
     ip rule add fwmark "$MARK" table "$TABLE" priority "$PRIO" 2>/dev/null
-    logger -t mihomo "route: fwmark $MARK -> table $TABLE -> $TUN"
+    marks="$MARK"
+    pm=$(policy_mark)
+    if [ -n "$pm" ]; then
+        ip rule add fwmark "$pm" table "$TABLE" priority "$PRIO" 2>/dev/null
+        marks="$marks + $pm ($POLICY_NAME)"
+    elif [ -n "$POLICY_NAME" ]; then
+        logger -t mihomo "route: policy '$POLICY_NAME' not found — devices.list only"
+    fi
+    logger -t mihomo "route: fwmark $marks -> table $TABLE -> $TUN"
 }
 
 del() {
-    while ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
+    del_rules
     ip route flush table "$TABLE" 2>/dev/null
+    del_marks
     logger -t mihomo "route: removed"
 }
 
 case "${1:-}" in
-    add) add ;;
-    del) del ;;
+    add)  add ;;
+    del)  del ;;
+    sync) sync_marks ;;
+    policymark) policy_mark ;;
     status)
+        echo "device marks (mangle/$CHAIN, mark $MARK):"
+        iptables -t mangle -S "$CHAIN" 2>/dev/null | grep -v '^-N' | sed 's/^/  /' \
+            || echo "  (chain missing)"
+        if [ -n "$POLICY_NAME" ]; then
+            pm=$(policy_mark)
+            echo "keenetic policy \"$POLICY_NAME\": ${pm:-not found}"
+        fi
         echo "rules:"
         ip rule show | grep -iE "$MARK|lookup $TABLE" || echo "  (none)"
         echo "table $TABLE:"
         ip route show table "$TABLE" 2>/dev/null | sed 's/^/  /' || echo "  (empty)"
         ;;
-    *) echo "usage: $0 {add|del|status}"; exit 1 ;;
+    *) echo "usage: $0 {add|del|sync|status|policymark}"; exit 1 ;;
 esac

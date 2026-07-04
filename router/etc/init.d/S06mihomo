@@ -1,7 +1,6 @@
 #!/bin/sh
 # /opt/etc/init.d/S06mihomo — Entware init for the mihomo VPN.
 # Started at boot by rc.unslung (any executable S* script) and by monit.
-# Naming: S06 = right after spider's old S05 slot (spider is disabled).
 
 BIN=/opt/sbin/mihomo
 DIR=/opt/etc/mihomo

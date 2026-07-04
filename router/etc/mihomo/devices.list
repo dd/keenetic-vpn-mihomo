@@ -1,0 +1,9 @@
+# /opt/etc/mihomo/devices.list — devices whose traffic goes through the VPN.
+# One entry per line: a MAC address or an IP (optionally with /CIDR).
+# Everything after the entry is a free-form comment.
+# Manage with:  te-vpn add <mac|ip> [comment]   /   te-vpn remove <mac|ip>
+#
+# Examples:
+#   aa:bb:cc:dd:ee:ff   laptop
+#   192.168.1.50        tv
+#   192.168.1.64/28     iot segment
