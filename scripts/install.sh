@@ -17,7 +17,7 @@
 # Usage:  sh scripts/install.sh
 #         ROUTER=root@10.0.0.1 PORT=22 sh scripts/install.sh   # another router
 #         POLICY_NAME=MyVPN sh scripts/install.sh              # policy name
-#         WAN_IF=PPPoE0 sh scripts/install.sh                  # non-default WAN
+#         WAN_IF=PPPoE0 sh scripts/install.sh                  # WAN fallback if auto-detect fails
 #         NO_POLICY=1 sh scripts/install.sh                    # devices.list only
 #         NO_MONIT=1 sh scripts/install.sh                     # skip monit
 #         NO_START=1 sh scripts/install.sh                     # deploy only
@@ -64,7 +64,7 @@ $R 'need=""
     fi'
 
 echo ">> Creating directories"
-$R 'mkdir -p /opt/sbin /opt/bin /opt/etc/mihomo/providers /opt/share/mihomo/ui \
+$R 'mkdir -p /opt/sbin /opt/bin /opt/etc/mihomo/providers \
              /opt/var/run /opt/var/log /opt/etc/monit.d \
              /opt/etc/ndm/wan.d /opt/etc/ndm/netfilter.d'
 
@@ -72,7 +72,25 @@ echo ">> Downloading mihomo ${MIHOMO_VER} (${MARCH}) on the router"
 $R "curl -fsSL '${MIHOMO_URL}' -o /tmp/mihomo.gz && gunzip -f /tmp/mihomo.gz && mv /tmp/mihomo /opt/sbin/mihomo && chmod +x /opt/sbin/mihomo && /opt/sbin/mihomo -v | head -1"
 
 echo ">> Downloading metacubexd web UI"
-$R "curl -fsSL '${UI_URL}' -o /tmp/ui.tgz && tar xzf /tmp/ui.tgz -C /opt/share/mihomo/ui --strip-components=1 && rm -f /tmp/ui.tgz && echo \"   UI files: \$(ls /opt/share/mihomo/ui | wc -l)\""
+# UI lives under the mihomo working dir (/opt/etc/mihomo) so it passes mihomo's
+# external-ui path guard. busybox tar has no --strip-components: extract to a
+# temp dir, then move the single top-level dir into place.
+$R "curl -fsSL '${UI_URL}' -o /tmp/ui.tgz \
+    && rm -rf /tmp/ui-x && mkdir -p /tmp/ui-x && tar xzf /tmp/ui.tgz -C /tmp/ui-x \
+    && inner=\$(find /tmp/ui-x -mindepth 1 -maxdepth 1 -type d | head -1) \
+    && rm -rf /opt/etc/mihomo/ui && mv \"\$inner\" /opt/etc/mihomo/ui \
+    && rm -rf /tmp/ui.tgz /tmp/ui-x \
+    && echo \"   UI files: \$(ls /opt/etc/mihomo/ui | wc -l)\""
+
+# Point metacubexd at its own origin by default, so opening the panel needs no
+# manual backend setup: mihomo serves the API and UI on one port, so the
+# backend is always the host you opened the panel from. Rewritten every install
+# because the UI download above replaces config.js with an empty default.
+$R "cat > /opt/etc/mihomo/ui/config.js <<'EOF'
+window.__METACUBEXD_CONFIG__ = {
+  defaultBackendURL: window.location.origin,
+}
+EOF"
 
 echo ">> Deploying router/ tree -> /opt"
 # Live files that may carry local state (subscription, device list, marks)
@@ -96,8 +114,11 @@ if [ -z "${NO_POLICY:-}" ]; then
     echo ">> Ensuring Keenetic access policy \"$POLICY_NAME\" exists"
     # The policy is how devices are put on the VPN from the web UI: the
     # firmware connmarks its members, te-vpn picks that mark up by name.
-    # 'permit global $WAN_IF' fills the policy's own routing table with a
-    # default route -> if mihomo is down, member devices fall back to direct.
+    # The permits fill the policy's own routing table with default routes ->
+    # if mihomo is down, member devices fall back to direct internet. We
+    # permit every WAN (global) connection + future ones ('permit auto') so
+    # the policy behaves like the default one whenever the VPN is out of the
+    # picture. \$WAN_IF is only the fallback if auto-detection finds nothing.
     $R "if ! command -v ndmc >/dev/null 2>&1; then
             echo '   ndmc not found (not a Keenetic?) — skipping, use: te-vpn add'
         elif ndmc -c 'show ip policy' 2>/dev/null | grep -q 'name = $POLICY_NAME[,:]'; then
@@ -105,8 +126,14 @@ if [ -z "${NO_POLICY:-}" ]; then
         else
             ndmc -c 'ip policy $POLICY_NAME'
             ndmc -c 'ip policy $POLICY_NAME description $POLICY_NAME'
-            ndmc -c 'ip policy $POLICY_NAME permit global $WAN_IF' \
-                || echo \"   WARN: 'permit global $WAN_IF' failed — set WAN_IF to your WAN connection name\"
+            wans=\$(ndmc -c 'show running-config' 2>/dev/null \
+                    | awk '/^interface /{i=\$2} /^[[:space:]]+ip global/{print i}')
+            [ -n \"\$wans\" ] || wans='$WAN_IF'
+            for w in \$wans; do
+                ndmc -c \"ip policy $POLICY_NAME permit global \$w\" \
+                    || echo \"   WARN: 'permit global \$w' failed\"
+            done
+            ndmc -c 'ip policy $POLICY_NAME permit auto'
             ndmc -c 'system configuration save'
             echo '   created (assign devices to it in the web UI)'
         fi"

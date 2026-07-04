@@ -30,7 +30,7 @@ echo ">> Removing files"
 $R 'rm -f /opt/sbin/mihomo /opt/bin/te-vpn \
           /opt/etc/init.d/S06mihomo /opt/etc/monit.d/mihomo.conf \
           /opt/etc/ndm/wan.d/10-mihomo.sh /opt/etc/ndm/netfilter.d/50-mihomo.sh
-    rm -rf /opt/share/mihomo'
+    rm -rf /opt/etc/mihomo/ui /opt/share/mihomo'
 $R 'command -v monit >/dev/null && monit reload 2>/dev/null; true'
 
 if [ -n "${PURGE:-}" ]; then

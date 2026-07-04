@@ -11,7 +11,7 @@ ipv6: false
 
 # --- Web admin / API ---------------------------------------------------------
 external-controller: 0.0.0.0:9090
-external-ui: /opt/share/mihomo/ui
+external-ui: /opt/etc/mihomo/ui   # must live under the working dir (-d) for mihomo's path guard
 external-ui-name: dashboard
 secret: ""                # set a password here to protect the UI/API if exposed
 
