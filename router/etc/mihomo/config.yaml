@@ -1,8 +1,6 @@
-# /opt/etc/mihomo/config.yaml
-# Self-contained mihomo VPN for Keenetic (Entware).
-# Traffic of devices listed in /opt/etc/mihomo/devices.list is marked by our
-# own iptables chain and routed into the mihomo TUN by policy routing
-# (see /opt/bin/mihomo-route and /opt/etc/mihomo/vpn.conf).
+# /opt/etc/mihomo/config.yaml — mihomo config for the te-vpn stack.
+# Device selection and policy routing are handled outside this file by
+# /opt/bin/te-vpn (settings: /opt/etc/mihomo/te-vpn.conf).
 
 mixed-port: 7890          # plain HTTP/SOCKS proxy too (optional, handy for tests)
 allow-lan: true
@@ -26,7 +24,7 @@ tun:
   enable: true
   device: mihomo0
   stack: gvisor           # gvisor = most portable on the 4.9 kernel
-  auto-route: false       # we manage routing ourselves (mihomo-route), no full hijack
+  auto-route: false       # we manage routing ourselves (te-vpn route), no full hijack
   auto-redirect: false
   auto-detect-interface: true   # mihomo finds the WAN iface (eth3) for its own egress
   dns-hijack:
@@ -68,7 +66,7 @@ proxy-providers:
     health-check:
       enable: true
       url: https://www.gstatic.com/generate_204
-      interval: 300
+      interval: 120
 
 # --- Server selection groups -------------------------------------------------
 proxy-groups:
@@ -81,9 +79,11 @@ proxy-groups:
       - AUTO
       - DIRECT
 
-  # AUTO: first healthy server from the subscription; DIRECT as last resort.
-  # Tolerates an empty/unfetched subscription (always has DIRECT) -> no startup
-  # failure and traffic still flows while the sub is being set up.
+  # AUTO: first healthy server from the subscription; DIRECT as last resort —
+  # if every server fails (dead endpoint, expired key), devices go direct
+  # instead of losing internet. Also tolerates an empty/unfetched subscription
+  # (always has DIRECT), so no startup failure while the sub is being set up.
+  # interval 120 = a dead server is detected within ~2 minutes.
   - name: AUTO
     type: fallback
     use:
@@ -91,7 +91,7 @@ proxy-groups:
     proxies:
       - DIRECT
     url: https://www.gstatic.com/generate_204
-    interval: 300
+    interval: 120
 
 # --- Rules -------------------------------------------------------------------
 rules:

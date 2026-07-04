@@ -7,7 +7,7 @@
 #   2. detects the router CPU arch and downloads the matching mihomo binary
 #   3. downloads the metacubexd web UI
 #   4. deploys the router/ tree to /opt (preserving an existing config.yaml,
-#      vpn.conf and devices.list — repo versions land as *.new)
+#      te-vpn.conf and devices.list — repo versions land as *.new)
 #   5. creates the Keenetic access policy "$POLICY_NAME" so devices can be
 #      routed into the VPN straight from the web UI
 #   6. validates the config and starts mihomo under monit supervision
@@ -25,7 +25,7 @@ set -e
 
 ROUTER="${ROUTER:-root@192.168.1.1}"
 PORT="${PORT:-222}"
-POLICY_NAME="${POLICY_NAME:-Mihomo}"
+POLICY_NAME="${POLICY_NAME:-te-vpn}"
 WAN_IF="${WAN_IF:-ISP}"
 R="ssh -o ConnectTimeout=10 -p $PORT $ROUTER"
 
@@ -78,7 +78,7 @@ echo ">> Deploying router/ tree -> /opt"
 # Live files that may carry local state (subscription, device list, marks)
 # are never overwritten: the repo version goes to <file>.new instead.
 KEEP=""
-for f in etc/mihomo/config.yaml etc/mihomo/vpn.conf etc/mihomo/devices.list; do
+for f in etc/mihomo/config.yaml etc/mihomo/te-vpn.conf etc/mihomo/devices.list; do
     if $R "test -f /opt/$f"; then
         echo "   /opt/$f exists — keeping it, repo copy goes to $f.new"
         KEEP="$KEEP --exclude=./$f"
@@ -89,18 +89,18 @@ done
 tar -C "$TREE" $KEEP -cf - . | $R 'tar -C /opt -xf -'
 
 echo ">> Setting permissions"
-$R 'chmod +x /opt/bin/mihomo-route /opt/bin/te-vpn /opt/etc/init.d/S06mihomo \
+$R 'chmod +x /opt/bin/te-vpn /opt/etc/init.d/S06mihomo \
              /opt/etc/ndm/wan.d/10-mihomo.sh /opt/etc/ndm/netfilter.d/50-mihomo.sh'
 
 if [ -z "${NO_POLICY:-}" ]; then
     echo ">> Ensuring Keenetic access policy \"$POLICY_NAME\" exists"
     # The policy is how devices are put on the VPN from the web UI: the
-    # firmware connmarks its members, mihomo-route picks that mark up by name.
+    # firmware connmarks its members, te-vpn picks that mark up by name.
     # 'permit global $WAN_IF' fills the policy's own routing table with a
     # default route -> if mihomo is down, member devices fall back to direct.
     $R "if ! command -v ndmc >/dev/null 2>&1; then
             echo '   ndmc not found (not a Keenetic?) — skipping, use: te-vpn add'
-        elif ndmc -c 'show ip policy' 2>/dev/null | grep -q 'name = $POLICY_NAME,'; then
+        elif ndmc -c 'show ip policy' 2>/dev/null | grep -q 'name = $POLICY_NAME[,:]'; then
             echo '   already exists'
         else
             ndmc -c 'ip policy $POLICY_NAME'
@@ -110,12 +110,12 @@ if [ -z "${NO_POLICY:-}" ]; then
             ndmc -c 'system configuration save'
             echo '   created (assign devices to it in the web UI)'
         fi"
-    # keep the live vpn.conf pointed at this policy (also upgrades old installs)
-    $R "grep -q '^POLICY_NAME=' /opt/etc/mihomo/vpn.conf 2>/dev/null \
-            && sed -i 's/^POLICY_NAME=.*/POLICY_NAME=$POLICY_NAME/' /opt/etc/mihomo/vpn.conf \
-            || printf '\nPOLICY_NAME=%s\n' '$POLICY_NAME' >> /opt/etc/mihomo/vpn.conf"
+    # keep the live te-vpn.conf pointed at this policy (also upgrades old installs)
+    $R "grep -q '^POLICY_NAME=' /opt/etc/mihomo/te-vpn.conf 2>/dev/null \
+            && sed -i 's/^POLICY_NAME=.*/POLICY_NAME=$POLICY_NAME/' /opt/etc/mihomo/te-vpn.conf \
+            || printf '\nPOLICY_NAME=%s\n' '$POLICY_NAME' >> /opt/etc/mihomo/te-vpn.conf"
 else
-    $R "sed -i 's/^POLICY_NAME=.*/POLICY_NAME=/' /opt/etc/mihomo/vpn.conf 2>/dev/null || true"
+    $R "sed -i 's/^POLICY_NAME=.*/POLICY_NAME=/' /opt/etc/mihomo/te-vpn.conf 2>/dev/null || true"
 fi
 
 if [ -z "${NO_MONIT:-}" ]; then

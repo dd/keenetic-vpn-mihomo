@@ -14,11 +14,11 @@ R="ssh -o ConnectTimeout=10 -p $PORT $ROUTER"
 
 echo ">> Stopping + un-supervising mihomo"
 $R 'command -v monit >/dev/null && monit unmonitor mihomo 2>/dev/null; true'
-$R '/opt/etc/init.d/S06mihomo stop 2>/dev/null || true'
-$R '/opt/bin/mihomo-route del 2>/dev/null || true'
+$R '/opt/bin/te-vpn down 2>/dev/null || true'
+$R '/opt/bin/te-vpn route del 2>/dev/null || true'
 
 echo ">> Removing the Keenetic access policy (its devices revert to default internet)"
-$R 'PN=$(sed -n "s/^POLICY_NAME=//p" /opt/etc/mihomo/vpn.conf 2>/dev/null | head -1)
+$R 'PN=$(sed -n "s/^POLICY_NAME=//p" /opt/etc/mihomo/te-vpn.conf 2>/dev/null | head -1)
     if [ -n "$PN" ] && command -v ndmc >/dev/null 2>&1; then
         ndmc -c "no ip policy $PN" 2>/dev/null && ndmc -c "system configuration save" >/dev/null 2>&1
         echo "   removed: $PN"
@@ -27,7 +27,7 @@ $R 'PN=$(sed -n "s/^POLICY_NAME=//p" /opt/etc/mihomo/vpn.conf 2>/dev/null | head
     fi'
 
 echo ">> Removing files"
-$R 'rm -f /opt/sbin/mihomo /opt/bin/te-vpn /opt/bin/mihomo-route \
+$R 'rm -f /opt/sbin/mihomo /opt/bin/te-vpn \
           /opt/etc/init.d/S06mihomo /opt/etc/monit.d/mihomo.conf \
           /opt/etc/ndm/wan.d/10-mihomo.sh /opt/etc/ndm/netfilter.d/50-mihomo.sh
     rm -rf /opt/share/mihomo'

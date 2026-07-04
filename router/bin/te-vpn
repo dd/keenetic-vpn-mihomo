@@ -1,44 +1,207 @@
 #!/bin/sh
-# /opt/bin/te-vpn — control the mihomo VPN on Keenetic.
+# /opt/bin/te-vpn — mihomo VPN manager for Keenetic (Entware).
+# All logic lives here; init.d, monit and the ndm hooks are thin shims.
 #
-#   te-vpn start|stop|restart        start/stop the VPN (+ monit supervision)
-#   te-vpn status                    process, TUN, routing, current server, sub, UI
-#   te-vpn add <mac|ip> [comment]    route a device through the VPN
-#   te-vpn remove <mac|ip>           stop routing a device through the VPN
-#   te-vpn devices                   list VPN devices
-#   te-vpn sub "<url>"               set a new subscription URL and reload
-#   te-vpn reload                    reload config + refresh subscription (no restart)
-#   te-vpn servers                   list available servers
-#   te-vpn select "<name>"           switch to a specific server (manual)
-#   te-vpn auto                      switch group to AUTO (first healthy server)
-#   te-vpn log [N]                   tail the mihomo log
+# User commands:
+#   te-vpn start|stop|restart     start/stop the VPN (+ monit supervision)
+#   te-vpn status                 process, TUN, devices, routing, server, sub
+#   te-vpn add <mac|ip> [note]    route a device through the VPN
+#   te-vpn remove <mac|ip>        stop routing a device through the VPN
+#   te-vpn devices                list devices added with `te-vpn add`
+#   te-vpn sub "<url>"            set the subscription URL and reload
+#   te-vpn servers                list servers from the subscription
+#   te-vpn select "<name>"        pin a specific server
+#   te-vpn auto                   automatic server selection by health-check
+#   te-vpn reload                 re-read config + refresh subscription
+#   te-vpn log [N]                tail the mihomo log
+#
+# Plumbing (used by init.d/monit/ndm hooks; safe to run by hand):
+#   te-vpn up|down                start/stop the daemon without touching monit
+#   te-vpn route add|del|sync|status|policymark
+#
+# Settings: /opt/etc/mihomo/te-vpn.conf
 
 DIR=/opt/etc/mihomo
 CONFIG=$DIR/config.yaml
+CONF=$DIR/te-vpn.conf
+[ -f "$CONF" ] && . "$CONF"
+MARK=${MARK:-0x6d69}
+TABLE=${TABLE:-1000}
+PRIO=${PRIO:-99}
+TUN=${TUN:-mihomo0}
+DEVICES=${DEVICES:-$DIR/devices.list}
+POLICY_NAME=${POLICY_NAME:-}
+
+BIN=/opt/sbin/mihomo
 API=http://127.0.0.1:9090
-INIT=/opt/etc/init.d/S06mihomo
 PIDFILE=/opt/var/run/mihomo.pid
 LOG=/opt/var/log/mihomo.log
 GROUP=PROXY
+CHAIN=MIHOMO
 
-VPNCONF=$DIR/vpn.conf
-[ -f "$VPNCONF" ] && . "$VPNCONF"
-DEVICES=${DEVICES:-$DIR/devices.list}
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+# Ignore HUP so an SSH disconnect can't kill us mid start/stop.
+trap '' HUP
 
 has_monit() { command -v monit >/dev/null 2>&1 && monit summary 2>/dev/null | grep -qi mihomo; }
-is_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }
+is_running() {
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && return 0
+    pidof mihomo >/dev/null 2>&1
+}
 lan_ip() { ip -4 -o addr show br0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1; }
-
 # tiny JSON value extractor: json_get '<key>' < json
 json_get() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1; }
 
+# --- routing: mark selected devices and steer both marks into the TUN --------
+#
+# Two sources of "this device goes through the VPN", active simultaneously:
+#   1. $DEVICES list — our iptables chain marks the listed MACs/IPs with $MARK.
+#   2. Keenetic access policy $POLICY_NAME — the firmware itself connmarks
+#      member devices (assigned in the web UI); we look that mark up by name.
+# ip rules at priority $PRIO (before Keenetic's own rules at 100) send both
+# marks to table $TABLE whose default route is the mihomo TUN.
+#
+# Fallback: if mihomo dies, the TUN and its route vanish, table $TABLE turns
+# empty, the rules stop matching and traffic falls through to the normal
+# routing — devices keep internet, just without the VPN.
+
+# fwmark of the Keenetic policy (matched by CLI name or UI description),
+# e.g. "0xffffaab". Empty if unset / not found / no ndmc on this box.
+policy_mark() {
+    [ -n "$POLICY_NAME" ] || return 1
+    command -v ndmc >/dev/null 2>&1 || return 1
+    # a policy line reads "policy, name = X, description = Y:" — the name is
+    # followed by "," when a description exists and by ":" when it doesn't
+    ndmc -c 'show ip policy' 2>/dev/null | awk -v n="$POLICY_NAME" '
+        /policy, name = / { cur = (index($0, "name = " n ",") > 0 || index($0, "name = " n ":") > 0 || index($0, "description = " n ":") > 0) }
+        cur && $1 == "mark:" { print "0x" $2; exit }'
+}
+
+# (re)build the device-marking chain from $DEVICES; idempotent
+sync_marks() {
+    iptables -t mangle -N "$CHAIN" 2>/dev/null
+    iptables -t mangle -F "$CHAIN"
+    n=0
+    if [ -f "$DEVICES" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            entry=${line%%#*}
+            entry=$(echo "$entry" | awk '{print $1}')
+            [ -z "$entry" ] && continue
+            case "$entry" in
+                *:*) iptables -t mangle -A "$CHAIN" -m mac --mac-source "$entry" \
+                         -j MARK --set-mark "$MARK" 2>/dev/null ;;
+                *)   iptables -t mangle -A "$CHAIN" -s "$entry" \
+                         -j MARK --set-mark "$MARK" 2>/dev/null ;;
+            esac || logger -t te-vpn "route: bad device entry '$entry'"
+            n=$((n + 1))
+        done < "$DEVICES"
+    fi
+    # append = after Keenetic's connmark restore, so our mark wins
+    iptables -t mangle -C PREROUTING -j "$CHAIN" 2>/dev/null || \
+        iptables -t mangle -A PREROUTING -j "$CHAIN"
+    logger -t te-vpn "route: synced $n device mark(s) -> $MARK"
+}
+
+del_marks() {
+    while iptables -t mangle -D PREROUTING -j "$CHAIN" 2>/dev/null; do :; done
+    iptables -t mangle -F "$CHAIN" 2>/dev/null
+    iptables -t mangle -X "$CHAIN" 2>/dev/null
+}
+
+# drop every rule pointing at our table (covers stale marks after a
+# policy rename/removal)
+del_rules() {
+    ip rule show | sed -n "s/.*fwmark \([^ ]*\) lookup $TABLE[[:space:]]*$/\1/p" \
+        | while read -r m; do
+              while ip rule del fwmark "$m" table "$TABLE" 2>/dev/null; do :; done
+          done
+}
+
+route_add() {
+    sync_marks
+    i=0
+    while ! ip link show "$TUN" >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -ge 10 ] && { logger -t te-vpn "route: $TUN not up after 10s"; return 1; }
+        sleep 1
+    done
+    ip route replace default dev "$TUN" table "$TABLE" 2>/dev/null
+    del_rules
+    ip rule add fwmark "$MARK" table "$TABLE" priority "$PRIO" 2>/dev/null
+    marks="$MARK"
+    pm=$(policy_mark)
+    if [ -n "$pm" ]; then
+        ip rule add fwmark "$pm" table "$TABLE" priority "$PRIO" 2>/dev/null
+        marks="$marks + $pm ($POLICY_NAME)"
+    elif [ -n "$POLICY_NAME" ]; then
+        logger -t te-vpn "route: policy '$POLICY_NAME' not found — devices.list only"
+    fi
+    logger -t te-vpn "route: fwmark $marks -> table $TABLE -> $TUN"
+}
+
+route_del() {
+    del_rules
+    ip route flush table "$TABLE" 2>/dev/null
+    del_marks
+    logger -t te-vpn "route: removed"
+}
+
+route_status() {
+    echo "device marks (mangle/$CHAIN, mark $MARK):"
+    iptables -t mangle -S "$CHAIN" 2>/dev/null | grep -v '^-N' | sed 's/^/  /' \
+        || echo "  (chain missing)"
+    if [ -n "$POLICY_NAME" ]; then
+        pm=$(policy_mark)
+        echo "keenetic policy \"$POLICY_NAME\": ${pm:-not found}"
+    fi
+    echo "rules:"
+    ip rule show | grep -iE "$MARK|lookup $TABLE" || echo "  (none)"
+    echo "table $TABLE:"
+    ip route show table "$TABLE" 2>/dev/null | sed 's/^/  /' || echo "  (empty)"
+}
+
+# --- daemon -------------------------------------------------------------------
+
+up() {
+    is_running && { echo "mihomo already running"; return 0; }
+    mkdir -p /opt/var/run /opt/var/log
+    ulimit -SHn 65535
+    echo "Starting mihomo..."
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$BIN" -- -d "$DIR" >>"$LOG" 2>&1
+    i=0
+    while [ "$i" -lt 15 ]; do          # wait for the controller API (max 15s)
+        curl -fsS "$API/version" >/dev/null 2>&1 && break
+        sleep 1; i=$((i + 1))
+    done
+    route_add
+    if is_running; then
+        echo "mihomo started (PID $(cat "$PIDFILE" 2>/dev/null))"
+    else
+        echo "mihomo FAILED to start — see $LOG"
+        return 1
+    fi
+}
+
+down() {
+    echo "Stopping mihomo..."
+    route_del
+    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+    sleep 1
+    pkill -KILL -f "$BIN -d $DIR" 2>/dev/null
+    rm -f "$PIDFILE"
+    echo "mihomo stopped"
+}
+
+# --- user commands -------------------------------------------------------------
+
 cmd_status() {
     echo "=== mihomo ==="
-    if is_running; then echo "  RUNNING (PID $(cat "$PIDFILE"))"; else echo "  STOPPED"; fi
+    if is_running; then echo "  RUNNING (PID $(cat "$PIDFILE" 2>/dev/null))"; else echo "  STOPPED"; fi
     has_monit && echo "  monit: supervised"
 
     echo "=== TUN ==="
-    ip -o link show mihomo0 2>/dev/null | sed 's/^/  /' || echo "  mihomo0: down"
+    ip -o link show "$TUN" 2>/dev/null | sed 's/^/  /' || echo "  $TUN: down"
 
     echo "=== devices -> VPN ==="
     if [ -f "$DEVICES" ] && grep -q '^[^#[:space:]]' "$DEVICES" 2>/dev/null; then
@@ -46,8 +209,8 @@ cmd_status() {
     else
         echo "  (none in devices.list — add with: te-vpn add <mac|ip>)"
     fi
-    if [ -n "${POLICY_NAME:-}" ]; then
-        pm=$(/opt/bin/mihomo-route policymark 2>/dev/null)
+    if [ -n "$POLICY_NAME" ]; then
+        pm=$(policy_mark)
         if [ -n "$pm" ]; then
             echo "  + Keenetic policy \"$POLICY_NAME\" (mark $pm) — assign devices in the web UI"
         else
@@ -56,7 +219,7 @@ cmd_status() {
     fi
 
     echo "=== routing ==="
-    /opt/bin/mihomo-route status 2>/dev/null | sed 's/^/  /'
+    route_status | sed 's/^/  /'
 
     echo "=== current server ==="
     now=$(curl -fsS "$API/proxies/$GROUP" 2>/dev/null | json_get now)
@@ -77,23 +240,35 @@ cmd_status() {
 
 case "${1:-}" in
     start)
-        "$INIT" start
+        up
         has_monit && monit monitor mihomo 2>/dev/null
         ;;
     stop)
         has_monit && monit unmonitor mihomo 2>/dev/null
-        "$INIT" stop
+        down
         ;;
     restart)
         has_monit && monit unmonitor mihomo 2>/dev/null
-        "$INIT" restart
+        down; sleep 2; up
         has_monit && monit monitor mihomo 2>/dev/null
+        ;;
+    up)   up ;;
+    down) down ;;
+    route)
+        case "${2:-}" in
+            add)        route_add ;;
+            del)        route_del ;;
+            sync)       sync_marks ;;
+            status)     route_status ;;
+            policymark) policy_mark ;;
+            *) echo "usage: te-vpn route {add|del|sync|status|policymark}"; exit 1 ;;
+        esac
         ;;
     status)
         cmd_status
         ;;
     add)
-        [ -z "${2:-}" ] && { echo "usage: te-vpn add <mac|ip> [comment]"; exit 1; }
+        [ -z "${2:-}" ] && { echo "usage: te-vpn add <mac|ip> [note]"; exit 1; }
         entry=$2; shift 2
         if grep -qiwF "$entry" "$DEVICES" 2>/dev/null; then
             echo "already listed: $entry"
@@ -101,18 +276,17 @@ case "${1:-}" in
             printf '%s%s\n' "$entry" "${*:+  # $*}" >> "$DEVICES"
             echo "added: $entry"
         fi
-        /opt/bin/mihomo-route sync
+        sync_marks
         ;;
     remove|del)
         [ -z "${2:-}" ] && { echo "usage: te-vpn remove <mac|ip>"; exit 1; }
         if grep -qiwF "$2" "$DEVICES" 2>/dev/null; then
-            # drop the matching non-comment line (case-insensitive for MACs)
             awk -v e="$2" 'BEGIN{e=tolower(e)}
                  /^[#[:space:]]/ {print; next}
                  tolower($1) != e {print}' "$DEVICES" > "$DEVICES.tmp" \
                 && mv "$DEVICES.tmp" "$DEVICES"
             echo "removed: $2"
-            /opt/bin/mihomo-route sync
+            sync_marks
         else
             echo "not found: $2 (see: te-vpn devices)"
         fi
@@ -122,7 +296,7 @@ case "${1:-}" in
         ;;
     sub)
         [ -z "${2:-}" ] && { echo "usage: te-vpn sub \"<subscription-url>\""; exit 1; }
-        # Only touch the line carrying the #sub marker (not the health-check url).
+        # only touch the line carrying the #sub marker (not the health-check url)
         sed -i "s#^\([[:space:]]*url:\).*#sub.*#\1 \"$2\"  #sub#" "$CONFIG"
         echo "subscription url updated"
         "$0" reload
@@ -163,7 +337,7 @@ case "${1:-}" in
         ;;
     *)
         echo "te-vpn start|stop|restart|status"
-        echo "    add <mac|ip> [comment] | remove <mac|ip> | devices"
-        echo "    sub \"<url>\" | reload | servers | select \"<name>\" | auto | log [N]"
+        echo "       add <mac|ip> [note] | remove <mac|ip> | devices"
+        echo "       sub \"<url>\" | servers | select \"<name>\" | auto | reload | log [N]"
         ;;
 esac
