@@ -96,6 +96,14 @@ proxy-providers:
       url: https://www.gstatic.com/generate_204
       interval: 120
 
+# --- Direct service bypass ---------------------------------------------------
+# Services listed here bypass the VPN even for VPN-selected devices.
+rule-providers:
+  direct-services:
+    type: file
+    behavior: classical
+    path: ./rules/direct-services.yaml
+
 # --- Server selection groups -------------------------------------------------
 proxy-groups:
   # PROXY: pick a specific server manually, or AUTO, or DIRECT (no VPN).
@@ -107,22 +115,19 @@ proxy-groups:
       - AUTO
       - DIRECT
 
-  # AUTO: first healthy server from the subscription; DIRECT as last resort —
-  # if every server fails (dead endpoint, expired key), devices go direct
-  # instead of losing internet. Also tolerates an empty/unfetched subscription
-  # (always has DIRECT), so no startup failure while the sub is being set up.
+  # AUTO: first healthy server from the subscription. DIRECT is intentionally
+  # not a member here; use PROXY -> DIRECT when you want to bypass the VPN.
   # interval 120 = a dead server is detected within ~2 minutes.
   - name: AUTO
     type: fallback
     use:
       - airport
-    proxies:
-      - DIRECT
     url: https://www.gstatic.com/generate_204
     interval: 120
 
 # --- Rules -------------------------------------------------------------------
 rules:
+  - RULE-SET,direct-services,DIRECT
   - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
   - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
   - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve

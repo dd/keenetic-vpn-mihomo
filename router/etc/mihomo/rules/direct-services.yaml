@@ -1,0 +1,44 @@
+payload:
+  # Yandex / Kinopoisk
+  - DOMAIN-SUFFIX,kinopoisk.ru
+  - DOMAIN-SUFFIX,ya.ru
+  - DOMAIN-SUFFIX,yandex.ru
+  - DOMAIN-SUFFIX,yandex.net
+  - DOMAIN-SUFFIX,yandexcdn.net
+  - DOMAIN-SUFFIX,yandexvideo.net
+  - DOMAIN-SUFFIX,yastatic.net
+  - DOMAIN-SUFFIX,yandex.st
+
+  # VK / OK / Mail.ru media and social services
+  - DOMAIN-SUFFIX,vk.com
+  - DOMAIN-SUFFIX,vk.ru
+  - DOMAIN-SUFFIX,vkvideo.ru
+  - DOMAIN-SUFFIX,vk-cdn.net
+  - DOMAIN-SUFFIX,vkuseraudio.net
+  - DOMAIN-SUFFIX,userapi.com
+  - DOMAIN-SUFFIX,ok.ru
+  - DOMAIN-SUFFIX,mycdn.me
+  - DOMAIN-SUFFIX,mail.ru
+  - DOMAIN-SUFFIX,imgsmail.ru
+
+  # Russian streaming services
+  - DOMAIN-SUFFIX,ivi.ru
+  - DOMAIN-SUFFIX,ivi.tv
+  - DOMAIN-SUFFIX,okko.tv
+  - DOMAIN-SUFFIX,okko.sport
+  - DOMAIN-SUFFIX,rutube.ru
+  - DOMAIN-SUFFIX,rutube.cc
+  - DOMAIN-SUFFIX,wink.ru
+  - DOMAIN-SUFFIX,wink.rt.ru
+  - DOMAIN-SUFFIX,kion.ru
+  - DOMAIN-SUFFIX,premier.one
+  - DOMAIN-SUFFIX,start.ru
+  - DOMAIN-SUFFIX,more.tv
+  - DOMAIN-SUFFIX,amediateka.ru
+
+  # TV channels and broadcaster platforms
+  - DOMAIN-SUFFIX,smotrim.ru
+  - DOMAIN-SUFFIX,vgtrk.com
+  - DOMAIN-SUFFIX,vesti.ru
+  - DOMAIN-SUFFIX,matchtv.ru
+  - DOMAIN-SUFFIX,ntvplus.tv

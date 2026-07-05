@@ -66,6 +66,7 @@ $R 'need=""
 
 echo ">> Creating directories"
 $R 'mkdir -p /opt/sbin /opt/bin /opt/etc/mihomo/providers \
+             /opt/etc/mihomo/rules \
              /opt/var/run /opt/var/log /opt/etc/monit.d \
              /opt/etc/ndm/wan.d /opt/etc/ndm/netfilter.d'
 
@@ -99,7 +100,7 @@ echo ">> Deploying router/ tree -> /opt"
 # old installs get the current transparent-proxy technical settings while
 # keeping their subscription URL.
 KEEP=""
-for f in etc/mihomo/config.yaml etc/mihomo/te-vpn.conf etc/mihomo/devices.list; do
+for f in etc/mihomo/config.yaml etc/mihomo/te-vpn.conf etc/mihomo/devices.list etc/mihomo/rules/direct-services.yaml; do
     if $R "test -f /opt/$f"; then
         KEEP="$KEEP --exclude=./$f"
         if $R "cat /opt/$f" | cmp -s - "$TREE/$f"; then
@@ -183,6 +184,50 @@ AWK
     awk -v redir_port="$redir_port" -v tproxy_port="$tproxy_port" \
         -f /tmp/te-vpn-upgrade-config.awk /opt/etc/mihomo/config.yaml > /opt/etc/mihomo/config.yaml.tmp
     mv /opt/etc/mihomo/config.yaml.tmp /opt/etc/mihomo/config.yaml'
+
+echo ">> Ensuring direct-service bypass rules are enabled"
+$R 'conf=/opt/etc/mihomo/config.yaml
+    mkdir -p /opt/etc/mihomo/rules
+    if ! grep -q "^[[:space:]]*direct-services:" "$conf" 2>/dev/null; then
+        awk '"'"'
+        function print_provider() {
+            print "  direct-services:"
+            print "    type: file"
+            print "    behavior: classical"
+            print "    path: ./rules/direct-services.yaml"
+        }
+        /^rule-providers:/ && !done {
+            print
+            print_provider()
+            done=1
+            next
+        }
+        /^proxy-providers:/ && !done {
+            print "# --- Direct service bypass ---------------------------------------------------"
+            print "# Services listed here bypass the VPN even for VPN-selected devices."
+            print "rule-providers:"
+            print_provider()
+            print ""
+            done=1
+        }
+        { print }
+        '"'"' "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
+    fi
+    if ! grep -q "RULE-SET,direct-services,DIRECT" "$conf" 2>/dev/null; then
+        awk '"'"'
+        /^rules:/ && !done {
+            print
+            print "  - RULE-SET,direct-services,DIRECT"
+            done=1
+            next
+        }
+        { print }
+        '"'"' "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
+    fi'
+
+echo ">> Ensuring AUTO selects VPN servers only"
+$R 'conf=/opt/etc/mihomo/config.yaml
+    sed -i "/^    proxies:$/ { N; /\\n      - DIRECT$/ d; }" "$conf"'
 
 echo ">> Setting permissions"
 $R 'chmod +x /opt/bin/te-vpn /opt/etc/init.d/S06mihomo \
