@@ -101,9 +101,14 @@ echo ">> Deploying router/ tree -> /opt"
 KEEP=""
 for f in etc/mihomo/config.yaml etc/mihomo/te-vpn.conf etc/mihomo/devices.list; do
     if $R "test -f /opt/$f"; then
-        echo "   /opt/$f exists — keeping it, repo copy goes to $f.new"
         KEEP="$KEEP --exclude=./$f"
-        $R "cat > /opt/$f.new" < "$TREE/$f"
+        if $R "cat /opt/$f" | cmp -s - "$TREE/$f"; then
+            echo "   /opt/$f matches the repo — kept as is"
+            $R "rm -f /opt/$f.new"
+        else
+            echo "   /opt/$f exists — keeping it, repo copy goes to $f.new"
+            $R "cat > /opt/$f.new" < "$TREE/$f"
+        fi
     fi
 done
 # shellcheck disable=SC2086

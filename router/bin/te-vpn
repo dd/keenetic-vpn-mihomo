@@ -76,6 +76,11 @@ json_get() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1; }
 # Fallback: controlled stops call route_del and remove our transparent proxy
 # chains; crash recovery is handled by monit, which restarts mihomo quickly.
 
+# Destinations that must stay on the router/LAN: local services, private nets,
+# link-local, multicast. Both delivery chains RETURN these before proxying.
+RESERVED_NETS="0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16
+               172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4"
+
 # fwmark of the Keenetic policy (matched by CLI name or UI description),
 # e.g. "0xffffaab". Empty if unset / not found / no ndmc on this box.
 policy_mark() {
@@ -115,18 +120,19 @@ mac_ips() {
     '
 }
 
+# entries from $DEVICES: first field only, '#'-comments and blank lines dropped
+device_entries() {
+    [ -f "$DEVICES" ] || return 0
+    awk '{ sub(/#.*/, "") } NF { print $1 }' "$DEVICES"
+}
+
 selected_ips() {
-    if [ -f "$DEVICES" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            entry=${line%%#*}
-            entry=$(echo "$entry" | awk '{print $1}')
-            [ -z "$entry" ] && continue
-            case "$entry" in
-                *:*) mac_ips "$entry" ;;
-                *)   echo "$entry" ;;
-            esac
-        done < "$DEVICES"
-    fi
+    device_entries | while IFS= read -r entry; do
+        case "$entry" in
+            *:*) mac_ips "$entry" ;;
+            *)   echo "$entry" ;;
+        esac
+    done
     policy_macs | while IFS= read -r mac; do
         [ -n "$mac" ] && mac_ips "$mac"
     done
@@ -156,112 +162,79 @@ flush_conntrack() {
     [ "$n" -gt 0 ] && logger -t te-vpn "conntrack: flushed $n selected device(s)"
 }
 
+# chain plumbing: every chain is (re)built and torn down the same way.
+# fresh_chain table chain  — create if missing, then empty
+# hook_chain  table chain  — jump to it from PREROUTING exactly once, appended
+#                            (= after Keenetic's own policy marking)
+# drop_chain  table chain  — unhook from PREROUTING, flush and delete
+fresh_chain() {
+    iptables -t "$1" -N "$2" 2>/dev/null
+    iptables -t "$1" -F "$2"
+}
+unhook_chain() {
+    while iptables -t "$1" -D PREROUTING -j "$2" 2>/dev/null; do :; done
+}
+hook_chain() {
+    unhook_chain "$1" "$2"
+    iptables -t "$1" -A PREROUTING -j "$2"
+}
+drop_chain() {
+    unhook_chain "$1" "$2"
+    iptables -t "$1" -F "$2" 2>/dev/null
+    iptables -t "$1" -X "$2" 2>/dev/null
+}
+
+# skip destinations that must not be proxied (see RESERVED_NETS)
+add_reserved_returns() {
+    for net in $RESERVED_NETS; do
+        iptables -t "$1" -A "$2" -d "$net" -j RETURN
+    done
+}
+
 # (re)build the device-marking chain from $DEVICES; idempotent
 sync_marks() {
-    iptables -t mangle -N "$CHAIN" 2>/dev/null
-    iptables -t mangle -F "$CHAIN"
-    n=0
-    if [ -f "$DEVICES" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            entry=${line%%#*}
-            entry=$(echo "$entry" | awk '{print $1}')
-            [ -z "$entry" ] && continue
-            case "$entry" in
-                *:*) iptables -t mangle -A "$CHAIN" -m mac --mac-source "$entry" \
-                         -j MARK --set-mark "$MARK" 2>/dev/null ;;
-                *)   iptables -t mangle -A "$CHAIN" -s "$entry" \
-                         -j MARK --set-mark "$MARK" 2>/dev/null ;;
-            esac || logger -t te-vpn "route: bad device entry '$entry'"
-            n=$((n + 1))
-        done < "$DEVICES"
-    fi
-    # append = after Keenetic's policy marking, before our delivery chains
-    while iptables -t mangle -D PREROUTING -j "$CHAIN" 2>/dev/null; do :; done
-    iptables -t mangle -A PREROUTING -j "$CHAIN"
+    fresh_chain mangle "$CHAIN"
+    device_entries | while IFS= read -r entry; do
+        case "$entry" in
+            *:*) iptables -t mangle -A "$CHAIN" -m mac --mac-source "$entry" \
+                     -j MARK --set-mark "$MARK" 2>/dev/null ;;
+            *)   iptables -t mangle -A "$CHAIN" -s "$entry" \
+                     -j MARK --set-mark "$MARK" 2>/dev/null ;;
+        esac || logger -t te-vpn "route: bad device entry '$entry'"
+    done
+    hook_chain mangle "$CHAIN"
+    n=$(iptables -t mangle -S "$CHAIN" 2>/dev/null | grep -c '^-A')
     logger -t te-vpn "route: synced $n device mark(s) -> $MARK"
 }
 
-del_marks() {
-    while iptables -t mangle -D PREROUTING -j "$CHAIN" 2>/dev/null; do :; done
-    iptables -t mangle -F "$CHAIN" 2>/dev/null
-    iptables -t mangle -X "$CHAIN" 2>/dev/null
-}
-
-add_tproxy_rules() {
-    mod=$1
-    mark=$2
+add_tproxy_rules() {  # $1 = fwmark to match
     [ "$BLOCK_QUIC" = "1" ] && \
-        iptables -t mangle -A "$TP_CHAIN" -p udp --dport 443 -m "$mod" --mark "$mark" -j DROP
-    iptables -t mangle -A "$TP_CHAIN" -p udp -m "$mod" --mark "$mark" \
+        iptables -t mangle -A "$TP_CHAIN" -p udp --dport 443 -m mark --mark "$1" -j DROP
+    iptables -t mangle -A "$TP_CHAIN" -p udp -m mark --mark "$1" \
         -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$TPROXY_MARK/$TPROXY_MARK"
 }
 
-add_redirect_rules() {
-    mod=$1
-    mark=$2
-    iptables -t nat -A "$REDIR_CHAIN" -p tcp -m "$mod" --mark "$mark" \
+add_redirect_rules() {  # $1 = fwmark to match
+    iptables -t nat -A "$REDIR_CHAIN" -p tcp -m mark --mark "$1" \
         -j REDIRECT --to-ports "$REDIR_PORT"
 }
 
+# UDP of selected devices -> mihomo via TPROXY ($PM is resolved in sync_all)
 sync_tproxy() {
-    iptables -t mangle -N "$TP_CHAIN" 2>/dev/null
-    iptables -t mangle -F "$TP_CHAIN"
-
-    # Packets for local services and LAN/multicast destinations must stay on
-    # the router/LAN. Selected UDP below is delivered to mihomo via TPROXY.
-    iptables -t mangle -A "$TP_CHAIN" -d 0.0.0.0/8 -j RETURN
-    iptables -t mangle -A "$TP_CHAIN" -d 10.0.0.0/8 -j RETURN
-    iptables -t mangle -A "$TP_CHAIN" -d 127.0.0.0/8 -j RETURN
-    iptables -t mangle -A "$TP_CHAIN" -d 169.254.0.0/16 -j RETURN
-    iptables -t mangle -A "$TP_CHAIN" -d 172.16.0.0/12 -j RETURN
-    iptables -t mangle -A "$TP_CHAIN" -d 192.168.0.0/16 -j RETURN
-    iptables -t mangle -A "$TP_CHAIN" -d 224.0.0.0/4 -j RETURN
-    iptables -t mangle -A "$TP_CHAIN" -d 240.0.0.0/4 -j RETURN
-
-    add_tproxy_rules mark "$MARK"
-    pm=$(policy_mark)
-    if [ -n "$pm" ]; then
-        add_tproxy_rules mark "$pm"
-        logger -t te-vpn "route: TPROXY policy '$POLICY_NAME' mark $pm -> :$TPROXY_PORT"
-    elif [ -n "$POLICY_NAME" ]; then
-        logger -t te-vpn "route: policy '$POLICY_NAME' not found — devices.list only"
-    fi
-
-    while iptables -t mangle -D PREROUTING -j "$TP_CHAIN" 2>/dev/null; do :; done
-    iptables -t mangle -A PREROUTING -j "$TP_CHAIN"
+    fresh_chain mangle "$TP_CHAIN"
+    add_reserved_returns mangle "$TP_CHAIN"
+    add_tproxy_rules "$MARK"
+    [ -n "$PM" ] && add_tproxy_rules "$PM"
+    hook_chain mangle "$TP_CHAIN"
 }
 
+# TCP of selected devices -> mihomo via nat REDIRECT
 sync_redirect() {
-    iptables -t nat -N "$REDIR_CHAIN" 2>/dev/null
-    iptables -t nat -F "$REDIR_CHAIN"
-
-    iptables -t nat -A "$REDIR_CHAIN" -d 0.0.0.0/8 -j RETURN
-    iptables -t nat -A "$REDIR_CHAIN" -d 10.0.0.0/8 -j RETURN
-    iptables -t nat -A "$REDIR_CHAIN" -d 127.0.0.0/8 -j RETURN
-    iptables -t nat -A "$REDIR_CHAIN" -d 169.254.0.0/16 -j RETURN
-    iptables -t nat -A "$REDIR_CHAIN" -d 172.16.0.0/12 -j RETURN
-    iptables -t nat -A "$REDIR_CHAIN" -d 192.168.0.0/16 -j RETURN
-    iptables -t nat -A "$REDIR_CHAIN" -d 224.0.0.0/4 -j RETURN
-    iptables -t nat -A "$REDIR_CHAIN" -d 240.0.0.0/4 -j RETURN
-
-    add_redirect_rules mark "$MARK"
-    pm=$(policy_mark)
-    [ -n "$pm" ] && add_redirect_rules mark "$pm"
-
-    while iptables -t nat -D PREROUTING -j "$REDIR_CHAIN" 2>/dev/null; do :; done
-    iptables -t nat -A PREROUTING -j "$REDIR_CHAIN"
-}
-
-del_tproxy() {
-    while iptables -t mangle -D PREROUTING -j "$TP_CHAIN" 2>/dev/null; do :; done
-    iptables -t mangle -F "$TP_CHAIN" 2>/dev/null
-    iptables -t mangle -X "$TP_CHAIN" 2>/dev/null
-}
-
-del_redirect() {
-    while iptables -t nat -D PREROUTING -j "$REDIR_CHAIN" 2>/dev/null; do :; done
-    iptables -t nat -F "$REDIR_CHAIN" 2>/dev/null
-    iptables -t nat -X "$REDIR_CHAIN" 2>/dev/null
+    fresh_chain nat "$REDIR_CHAIN"
+    add_reserved_returns nat "$REDIR_CHAIN"
+    add_redirect_rules "$MARK"
+    [ -n "$PM" ] && add_redirect_rules "$PM"
+    hook_chain nat "$REDIR_CHAIN"
 }
 
 # Allow forwarding LAN <-> tunnel. This is only a stale TUN-era cleanup helper;
@@ -272,7 +245,15 @@ del_forward() {
 }
 
 # Re-assert firewall chains the firmware may have wiped on a firewall rebuild.
+# The Keenetic policy mark is looked up once here (one ndmc round-trip — this
+# runs from NDM hooks that must be fast) and shared by both delivery chains.
 sync_all() {
+    PM=$(policy_mark)
+    if [ -n "$PM" ]; then
+        logger -t te-vpn "route: policy '$POLICY_NAME' mark $PM -> transparent proxy"
+    elif [ -n "$POLICY_NAME" ]; then
+        logger -t te-vpn "route: policy '$POLICY_NAME' not found — devices.list only"
+    fi
     sync_marks
     sync_tproxy
     sync_redirect
@@ -303,17 +284,18 @@ route_add() {
 }
 
 route_sync() {
-    route_apply
-    flush_conntrack
-    logger -t te-vpn "route: TCP REDIRECT :$REDIR_PORT + UDP TPROXY :$TPROXY_PORT"
+    # NDM hooks call "sync" after firewall/WAN rebuilds. The desired state is
+    # the same as "add"; keep the wrapper so the hook-facing command stays
+    # self-documenting while the implementation remains single-path.
+    route_add
 }
 
 route_del() {
     del_rules
     ip route flush table "$TABLE" 2>/dev/null
-    del_marks
-    del_tproxy
-    del_redirect
+    drop_chain mangle "$CHAIN"
+    drop_chain mangle "$TP_CHAIN"
+    drop_chain nat "$REDIR_CHAIN"
     del_forward
     logger -t te-vpn "route: removed"
 }
@@ -440,8 +422,8 @@ case "${1:-}" in
     route)
         case "${2:-}" in
             add)        route_add ;;
-            del)        route_del ;;
             sync)       route_sync ;;
+            del)        route_del ;;
             status)     route_status ;;
             policymark) policy_mark ;;
             *) echo "usage: te-vpn route {add|del|sync|status|policymark}"; exit 1 ;;
