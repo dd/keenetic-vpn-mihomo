@@ -271,16 +271,11 @@ del_forward() {
     while iptables -D FORWARD -i "$TUN" -j ACCEPT 2>/dev/null; do :; done
 }
 
-# re-assert everything the firmware may have wiped on a firewall rebuild.
+# Re-assert firewall chains the firmware may have wiped on a firewall rebuild.
 sync_all() {
     sync_marks
     sync_tproxy
     sync_redirect
-}
-
-route_sync() {
-    sync_all
-    flush_conntrack
 }
 
 # drop every rule pointing at our table (covers stale marks after a policy
@@ -293,12 +288,22 @@ del_rules() {
     while ip rule del fwmark "$TPROXY_MARK/$TPROXY_MARK" table 100 2>/dev/null; do :; done
 }
 
-route_add() {
+route_apply() {
     sync_all
     del_rules
     ip route replace local default dev lo table "$TABLE" 2>/dev/null
     ip route flush table 100 2>/dev/null
     ip rule add fwmark "$TPROXY_MARK/$TPROXY_MARK" table "$TABLE" priority "$PRIO" 2>/dev/null
+}
+
+route_add() {
+    route_apply
+    flush_conntrack
+    logger -t te-vpn "route: TCP REDIRECT :$REDIR_PORT + UDP TPROXY :$TPROXY_PORT"
+}
+
+route_sync() {
+    route_apply
     flush_conntrack
     logger -t te-vpn "route: TCP REDIRECT :$REDIR_PORT + UDP TPROXY :$TPROXY_PORT"
 }
@@ -314,6 +319,7 @@ route_del() {
 }
 
 route_status() {
+    pm=""
     echo "device marks (mangle/$CHAIN, mark $MARK):"
     iptables -t mangle -S "$CHAIN" 2>/dev/null | grep -v '^-N' | sed 's/^/  /' \
         || echo "  (chain missing)"
@@ -322,7 +328,7 @@ route_status() {
         echo "keenetic policy \"$POLICY_NAME\": ${pm:-not found}"
     fi
     echo "rules:"
-    ip rule show | grep -iE "$TPROXY_MARK|$MARK|lookup $TABLE" || echo "  (none)"
+    ip rule show | grep -iE "$TPROXY_MARK|$MARK|${pm:-__no_policy_mark__}|lookup $TABLE" || echo "  (none)"
     echo "table $TABLE:"
     ip route show table "$TABLE" 2>/dev/null | sed 's/^/  /' || echo "  (empty)"
     echo "tproxy (mangle/$TP_CHAIN, port $TPROXY_PORT, mark $TPROXY_MARK):"

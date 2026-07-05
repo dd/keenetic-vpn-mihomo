@@ -109,6 +109,20 @@ done
 # shellcheck disable=SC2086
 tar -C "$TREE" $KEEP -cf - . | $R 'tar -C /opt -xf -'
 
+echo ">> Ensuring live te-vpn settings have current defaults"
+$R 'conf=/opt/etc/mihomo/te-vpn.conf
+    ensure_setting() {
+        key=$1
+        val=$2
+        grep -q "^$key=" "$conf" 2>/dev/null || printf "%s=%s\n" "$key" "$val" >> "$conf"
+    }
+    ensure_setting REDIR_PORT 7892
+    ensure_setting TPROXY_PORT 7895
+    ensure_setting TPROXY_MARK 0x1
+    ensure_setting BLOCK_QUIC 1
+    ensure_setting CONNTRACK_FLUSH 1
+    ensure_setting CONNTRACK_FLUSH_INTERVAL 20'
+
 echo ">> Ensuring live mihomo config matches transparent-proxy mode"
 $R 'cat > /tmp/te-vpn-upgrade-config.awk <<'"'"'AWK'"'"'
 BEGIN { skip=0; inserted=0 }
@@ -117,8 +131,8 @@ skip && /^[^[:space:]]/ { skip=0 }
 skip { next }
 /^mixed-port:/ {
     print
-    print "redir-port: 7892          # TCP transparent proxy entrypoint used by te-vpn"
-    print "tproxy-port: 7895         # UDP transparent proxy entrypoint used by te-vpn"
+    print "redir-port: " redir_port "          # TCP transparent proxy entrypoint used by te-vpn"
+    print "tproxy-port: " tproxy_port "         # UDP transparent proxy entrypoint used by te-vpn"
     next
 }
 /^redir-port:/ || /^tproxy-port:/ { next }
@@ -156,8 +170,13 @@ in_tun && /^[^[:space:]]/ { in_tun=0 }
 /enhanced-mode:/ { print "  enhanced-mode: redir-host"; next }
 { print }
 AWK
+    redir_port=$(sed -n "s/^REDIR_PORT=//p" /opt/etc/mihomo/te-vpn.conf | tail -1)
+    tproxy_port=$(sed -n "s/^TPROXY_PORT=//p" /opt/etc/mihomo/te-vpn.conf | tail -1)
+    redir_port=${redir_port:-7892}
+    tproxy_port=${tproxy_port:-7895}
     cp /opt/etc/mihomo/config.yaml /opt/etc/mihomo/config.yaml.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null || true
-    awk -f /tmp/te-vpn-upgrade-config.awk /opt/etc/mihomo/config.yaml > /opt/etc/mihomo/config.yaml.tmp
+    awk -v redir_port="$redir_port" -v tproxy_port="$tproxy_port" \
+        -f /tmp/te-vpn-upgrade-config.awk /opt/etc/mihomo/config.yaml > /opt/etc/mihomo/config.yaml.tmp
     mv /opt/etc/mihomo/config.yaml.tmp /opt/etc/mihomo/config.yaml'
 
 echo ">> Setting permissions"
