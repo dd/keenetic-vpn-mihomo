@@ -30,7 +30,7 @@ MARK=${MARK:-0x6d69}
 REDIR_PORT=${REDIR_PORT:-7892}
 TPROXY_PORT=${TPROXY_PORT:-7895}
 TPROXY_MARK=${TPROXY_MARK:-0x1}
-BLOCK_QUIC=${BLOCK_QUIC:-1}
+BLOCK_QUIC=${BLOCK_QUIC:-0}
 CONNTRACK_FLUSH=${CONNTRACK_FLUSH:-1}
 CONNTRACK_FLUSH_INTERVAL=${CONNTRACK_FLUSH_INTERVAL:-20}
 TABLE=${TABLE:-1000}
@@ -71,7 +71,7 @@ json_get() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1; }
 #   2. Keenetic access policy $POLICY_NAME — the firmware itself connmarks
 #      member devices (assigned in the web UI); we look that mark up by name.
 # A nat REDIRECT chain sends selected TCP packets to mihomo's redir-port. UDP is
-# handled by TPROXY; QUIC/HTTP3 can be dropped so clients fall back to TCP.
+# handled by TPROXY; QUIC/HTTP3 is allowed unless BLOCK_QUIC=1.
 #
 # Fallback: controlled stops call route_del and remove our transparent proxy
 # chains; crash recovery is handled by monit, which restarts mihomo quickly.

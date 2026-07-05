@@ -124,7 +124,7 @@ $R 'conf=/opt/etc/mihomo/te-vpn.conf
     ensure_setting REDIR_PORT 7892
     ensure_setting TPROXY_PORT 7895
     ensure_setting TPROXY_MARK 0x1
-    ensure_setting BLOCK_QUIC 1
+    ensure_setting BLOCK_QUIC 0
     ensure_setting CONNTRACK_FLUSH 1
     ensure_setting CONNTRACK_FLUSH_INTERVAL 20'
 
