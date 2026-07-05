@@ -1,0 +1,26 @@
+# Editor / IDE local state
+*.sublime-project
+*.sublime-workspace
+.idea/
+.vscode/
+
+# macOS / filesystem metadata
+.DS_Store
+._*
+
+# Local runtime output and scratch files
+*.log
+*.pid
+*.tmp
+*.bak
+*.bak.*
+*.new
+*.orig
+
+# Downloaded release artifacts
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.zip
+
