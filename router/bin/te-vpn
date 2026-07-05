@@ -13,6 +13,7 @@
 #   te-vpn select "<name>"        pin a specific server
 #   te-vpn auto                   automatic server selection by health-check
 #   te-vpn reload                 re-read config + refresh subscription
+#   te-vpn flush                  drop stale connections for VPN devices
 #   te-vpn log [N]                tail the mihomo log
 #
 # Plumbing (used by init.d/monit/ndm hooks; safe to run by hand):
@@ -30,6 +31,8 @@ REDIR_PORT=${REDIR_PORT:-7892}
 TPROXY_PORT=${TPROXY_PORT:-7895}
 TPROXY_MARK=${TPROXY_MARK:-0x1}
 BLOCK_QUIC=${BLOCK_QUIC:-1}
+CONNTRACK_FLUSH=${CONNTRACK_FLUSH:-1}
+CONNTRACK_FLUSH_INTERVAL=${CONNTRACK_FLUSH_INTERVAL:-20}
 TABLE=${TABLE:-1000}
 PRIO=${PRIO:-99}
 TUN=${TUN:-mihomo0}
@@ -41,6 +44,7 @@ API=http://127.0.0.1:9090
 PIDFILE=/opt/var/run/mihomo.pid
 LOG=/opt/var/log/mihomo.log
 POLICY_MARK_CACHE=/opt/var/run/te-vpn.policy_mark
+CONNTRACK_FLUSH_STAMP=/opt/var/run/te-vpn.conntrack_flush
 GROUP=PROXY
 CHAIN=MIHOMO
 TP_CHAIN=MIHOMO_TP
@@ -94,6 +98,62 @@ policy_mark() {
     # devices from transparent proxy rules.
     [ -s "$POLICY_MARK_CACHE" ] && { cat "$POLICY_MARK_CACHE"; return 0; }
     return 1
+}
+
+policy_macs() {
+    [ -n "$POLICY_NAME" ] || return 0
+    command -v ndmc >/dev/null 2>&1 || return 0
+    ndmc -c 'show running-config' 2>/dev/null | awk -v p="$POLICY_NAME" '
+        $1 == "host" && $3 == "policy" && $4 == p { print tolower($2) }
+    '
+}
+
+mac_ips() {
+    mac=$(echo "$1" | tr 'A-F' 'a-f')
+    ip neigh show 2>/dev/null | awk -v m="$mac" '
+        tolower($0) ~ ("lladdr " m " ") { print $1 }
+    '
+}
+
+selected_ips() {
+    if [ -f "$DEVICES" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            entry=${line%%#*}
+            entry=$(echo "$entry" | awk '{print $1}')
+            [ -z "$entry" ] && continue
+            case "$entry" in
+                *:*) mac_ips "$entry" ;;
+                *)   echo "$entry" ;;
+            esac
+        done < "$DEVICES"
+    fi
+    policy_macs | while IFS= read -r mac; do
+        [ -n "$mac" ] && mac_ips "$mac"
+    done
+}
+
+flush_conntrack() {
+    command -v conntrack >/dev/null 2>&1 || return 0
+    [ "${CONNTRACK_FLUSH:-1}" = "1" ] || [ "${1:-}" = "force" ] || return 0
+    now=$(date +%s 2>/dev/null || echo 0)
+    if [ "${1:-}" != "force" ] && [ -s "$CONNTRACK_FLUSH_STAMP" ]; then
+        last=$(cat "$CONNTRACK_FLUSH_STAMP" 2>/dev/null || echo 0)
+        [ "$now" -gt 0 ] && [ "$last" -gt 0 ] \
+            && [ $((now - last)) -lt "${CONNTRACK_FLUSH_INTERVAL:-20}" ] && return 0
+    fi
+    mkdir -p "${CONNTRACK_FLUSH_STAMP%/*}" 2>/dev/null
+    echo "$now" > "$CONNTRACK_FLUSH_STAMP" 2>/dev/null
+
+    tmp=/opt/var/run/te-vpn.flush.$$
+    mkdir -p "${tmp%/*}" 2>/dev/null
+    selected_ips | sort -u > "$tmp" 2>/dev/null || return 0
+    n=0
+    while IFS= read -r ip; do
+        [ -n "$ip" ] || continue
+        conntrack -D -s "$ip" >/dev/null 2>&1 && n=$((n + 1))
+    done < "$tmp"
+    rm -f "$tmp"
+    [ "$n" -gt 0 ] && logger -t te-vpn "conntrack: flushed $n selected device(s)"
 }
 
 # (re)build the device-marking chain from $DEVICES; idempotent
@@ -218,6 +278,11 @@ sync_all() {
     sync_redirect
 }
 
+route_sync() {
+    sync_all
+    flush_conntrack
+}
+
 # drop every rule pointing at our table (covers stale marks after a policy
 # rename/removal) plus the old POC table-100 TPROXY rule if present.
 del_rules() {
@@ -234,6 +299,7 @@ route_add() {
     ip route replace local default dev lo table "$TABLE" 2>/dev/null
     ip route flush table 100 2>/dev/null
     ip rule add fwmark "$TPROXY_MARK/$TPROXY_MARK" table "$TABLE" priority "$PRIO" 2>/dev/null
+    flush_conntrack
     logger -t te-vpn "route: TCP REDIRECT :$REDIR_PORT + UDP TPROXY :$TPROXY_PORT"
 }
 
@@ -369,7 +435,7 @@ case "${1:-}" in
         case "${2:-}" in
             add)        route_add ;;
             del)        route_del ;;
-            sync)       sync_all ;;
+            sync)       route_sync ;;
             status)     route_status ;;
             policymark) policy_mark ;;
             *) echo "usage: te-vpn route {add|del|sync|status|policymark}"; exit 1 ;;
@@ -388,6 +454,7 @@ case "${1:-}" in
             echo "added: $entry"
         fi
         sync_marks
+        flush_conntrack force
         ;;
     remove|del)
         [ -z "${2:-}" ] && { echo "usage: te-vpn remove <mac|ip>"; exit 1; }
@@ -398,6 +465,7 @@ case "${1:-}" in
                 && mv "$DEVICES.tmp" "$DEVICES"
             echo "removed: $2"
             sync_marks
+            flush_conntrack force
         else
             echo "not found: $2 (see: te-vpn devices)"
         fi
@@ -445,6 +513,7 @@ case "${1:-}" in
             -H 'Content-Type: application/json' \
             -d "{\"name\":\"$2\"}" >/dev/null 2>&1; then
             echo "selected: $2"
+            flush_conntrack force
         else
             echo "failed — check the exact name with: te-vpn servers"
         fi
@@ -452,7 +521,11 @@ case "${1:-}" in
     auto)
         curl -fsS -X PUT "$API/proxies/$GROUP" \
             -H 'Content-Type: application/json' -d '{"name":"AUTO"}' >/dev/null 2>&1 \
-            && echo "switched to AUTO"
+            && { echo "switched to AUTO"; flush_conntrack force; }
+        ;;
+    flush)
+        flush_conntrack force
+        echo "conntrack flushed for selected devices"
         ;;
     log)
         tail -n "${2:-40}" "$LOG"
@@ -460,6 +533,6 @@ case "${1:-}" in
     *)
         echo "te-vpn start|stop|restart|status"
         echo "       add <mac|ip> [note] | remove <mac|ip> | devices"
-        echo "       sub \"<url>\" | servers | select \"<name>\" | auto | reload | log [N]"
+        echo "       sub \"<url>\" | servers | select \"<name>\" | auto | reload | flush | log [N]"
         ;;
 esac
